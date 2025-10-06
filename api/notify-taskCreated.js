@@ -3,14 +3,10 @@ import admin from "firebase-admin";
 let app;
 function initAdmin() {
   if (!app) {
-    const projectId = process.env.FIREBASE_PROJECT_ID;
-    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-    let privateKey = process.env.FIREBASE_PRIVATE_KEY || "";
-    // Vercel хранит ключи без \n — восстановим переводы строк:
-    privateKey = privateKey.replace(/\\n/g, "\n");
-
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     app = admin.initializeApp({
-      credential: admin.credential.cert({ projectId, clientEmail, privateKey })
+      credential: admin.credential.cert(serviceAccount),
+      projectId: serviceAccount.project_id,
     });
   }
   return app;
