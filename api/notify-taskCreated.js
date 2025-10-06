@@ -1,4 +1,4 @@
-import admin from "firebase-admin";
+const admin = require("firebase-admin");
 
 let app;
 function initAdmin() {
