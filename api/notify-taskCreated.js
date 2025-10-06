@@ -9,15 +9,10 @@ function initAdmin() {
     if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
 
     const sa = JSON.parse(raw);
-
-    // Нормализуем ключ: превращаем \n в реальные переводы строк
-    // (покрывает случаи с "\n" и "\\n")
     sa.private_key = sa.private_key
       .replace(/\\n/g, "\n")
       .replace(/\r\n/g, "\n")
       .trim();
-
-    console.log("🔍 private_key starts:", sa.private_key.slice(0, 30));
 
     app = admin.initializeApp({
       credential: admin.credential.cert(sa),
@@ -29,11 +24,8 @@ function initAdmin() {
   return app;
 }
 
-async function collectAssigneeTokens(db, task) {
-  let assigneeIds = Array.isArray(task.assigneeIds) ? task.assigneeIds : [];
-  if ((!assigneeIds || assigneeIds.length === 0) && Array.isArray(task.assignees)) {
-    assigneeIds = task.assignees.map(a => (typeof a === "string" ? a : a.uid)).filter(Boolean);
-  }
+/** Собираем FCM-токены исполнителей (исключая автора) */
+async function collectAssigneeTokens(db, assigneeIds, authorUid) {
   if (!assigneeIds?.length) return [];
 
   const tokens = new Set();
@@ -42,11 +34,14 @@ async function collectAssigneeTokens(db, task) {
     const u = snap.data() || {};
     (Array.isArray(u.fcmTokens) ? u.fcmTokens : []).forEach(t => t && tokens.add(t));
   }
-  if (task.authorUid) {
-    const ad = await db.collection("users").doc(task.authorUid).get();
+
+  // выкидываем токены автора, чтобы он сам не получил пуш
+  if (authorUid) {
+    const ad = await db.collection("users").doc(authorUid).get();
     const au = ad.data() || {};
     (Array.isArray(au.fcmTokens) ? au.fcmTokens : []).forEach(t => tokens.delete(t));
   }
+
   return [...tokens];
 }
 
@@ -57,15 +52,55 @@ export default async function handler(req, res) {
     const taskId = (req.body?.taskId || "").trim();
     if (!taskId) return res.status(400).send("taskId required");
 
+    // 👇 Новое: читаем assigneeIds, если клиент передал
+    const rawAssignees = (req.body?.assigneeIds || "").trim();
+    let assigneeIds = [];
+
+    if (rawAssignees) {
+      // передано строкой: "uid1,uid2,..."
+      assigneeIds = rawAssignees.split(",").map(s => s.trim()).filter(Boolean);
+    }
+
     initAdmin();
     const db = admin.firestore();
 
+    // Загружаем задачу для резервного случая (и для текста уведомления)
     const snap = await db.collection("tasks").doc(taskId).get();
     if (!snap.exists) return res.status(404).send("task not found");
     const task = snap.data() || {};
 
-    const tokens = await collectAssigneeTokens(db, task);
-    if (!tokens.length) return res.status(200).json({ sent: 0, reason: "no tokens" });
+    // если с клиента не пришли assigneeIds — берём из Firestore
+    if (!assigneeIds.length) {
+      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds;
+      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees;
+    }
+
+    // --- если и здесь пусто → значит это самовывоз → всем кладовщикам ---
+    let tokens = [];
+    if (assigneeIds.length) {
+      tokens = await collectAssigneeTokens(db, assigneeIds, task.creatorId || task.authorUid);
+    } else {
+      console.log("📦 No assigneeIds → sending to all storekeepers (pickup mode)");
+      const roles = ["кладовщик", "Кладовщик", "storekeeper", "kladovshik"];
+      const qs = await db.collection("users").whereIn("role", roles).get();
+      qs.docs.forEach(doc => {
+        const u = doc.data() || {};
+        (Array.isArray(u.fcmTokens) ? u.fcmTokens : []).forEach(t => t && tokens.push(t));
+      });
+      // убираем дубли и токены автора
+      tokens = [...new Set(tokens)];
+      if (task.creatorId) {
+        const ad = await db.collection("users").doc(task.creatorId).get();
+        const au = ad.data() || {};
+        (Array.isArray(au.fcmTokens) ? au.fcmTokens : []).forEach(t => {
+          tokens = tokens.filter(x => x !== t);
+        });
+      }
+    }
+
+    if (!tokens.length) {
+      return res.status(200).json({ sent: 0, reason: "no tokens" });
+    }
 
     const title = "Новая задача";
     const body = task.title ? String(task.title) : `Задача ${taskId}`;
@@ -84,6 +119,8 @@ export default async function handler(req, res) {
 
     const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
+    console.log(`📨 Sent: ${resp.successCount}, failed: ${resp.failureCount}, to ${tokens.length} tokens`);
+
     return res.status(200).json({
       sent: resp.successCount,
       failed: resp.failureCount,
@@ -94,4 +131,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: e.message });
   }
 }
-
