@@ -15,7 +15,9 @@ function initAdmin() {
       console.error("Invalid FIREBASE_SERVICE_ACCOUNT JSON:", e);
       throw e;
     }
-
+const sa = JSON.parse(raw);
+    // 🔹 восстановим настоящие переводы строк:
+    sa.private_key = sa.private_key.replace(/\\n/g, "\n");
     app = admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       projectId: serviceAccount.project_id, // обязательно вручную
