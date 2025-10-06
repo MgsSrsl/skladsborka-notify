@@ -1,29 +1,23 @@
-import admin from "firebase-admin";
+mport admin from "firebase-admin";
 
 let app;
-
-// ---- 1. Инициализация Firebase Admin через JSON-переменную ----
 function initAdmin() {
   if (!app) {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-    if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT env var");
+    if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
 
-    let serviceAccount;
-    try {
-      serviceAccount = JSON.parse(raw);
-    } catch (e) {
-      console.error("Invalid FIREBASE_SERVICE_ACCOUNT JSON:", e);
-      throw e;
-    }
-const sa = JSON.parse(raw);
-    // 🔹 восстановим настоящие переводы строк:
-    sa.private_key = sa.private_key.replace(/\\n/g, "\n");
+    const sa = JSON.parse(raw);
+
+    // 🔹 Эта строка обязательна: превращаем \\n → \n
+    sa.private_key = sa.private_key.replace(/\\\\n/g, "\n");
+
+    console.log("🔍 private_key preview:", sa.private_key.slice(0, 40));
+
     app = admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      projectId: serviceAccount.project_id, // обязательно вручную
+      credential: admin.credential.cert(sa),
+      projectId: sa.project_id,
     });
-
-    console.log("✅ Firebase Admin initialized for project:", serviceAccount.project_id);
+    console.log("✅ Firebase initialized:", sa.project_id);
   }
   return app;
 }
