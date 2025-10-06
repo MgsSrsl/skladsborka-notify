@@ -23,25 +23,58 @@ function initAdmin() {
   return app;
 }
 
-/** Собираем FCM-токены исполнителей (исключая автора) */
-async function collectAssigneeTokens(db, assigneeIds, authorUid) {
-  if (!assigneeIds?.length) return [];
-  const tokens = new Set();
+// --- utils ---
+function normRole(role) {
+  const s = String(role || "").toLowerCase().trim();
+  if (["кладовщик", "кладовщица", "storekeeper", "kladovshik", "кладовщик склада"].includes(s)) return "storekeeper";
+  if (["начальник", "head", "boss"].includes(s)) return "head";
+  if (["менеджер", "manager"].includes(s)) return "manager";
+  return s;
+}
 
-  for (const uid of assigneeIds) {
-    const snap = await db.collection("users").doc(uid).get();
-    const u = snap.data() || {};
-    (Array.isArray(u.fcmTokens) ? u.fcmTokens : []).forEach(t => t && tokens.add(t));
+async function getUserById(db, uid) {
+  const snap = await db.collection("users").doc(uid).get();
+  return { id: uid, ...(snap.data() || {}) };
+}
+
+/**
+ * Возвращает массив FCM-токенов получателей по правилам:
+ * - если есть assigneeIds → пуш ТОЛЬКО им;
+ * - если assigneeIds пуст (самовывоз) → всем, у кого onPickup==true И роль кладовщика;
+ * - автор исключается всегда.
+ */
+async function collectTargetTokens({ db, assigneeIds, authorUid }) {
+  let tokens = [];
+
+  if (Array.isArray(assigneeIds) && assigneeIds.length) {
+    // Явные исполнители
+    for (const uid of assigneeIds) {
+      const u = await getUserById(db, uid);
+      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
+      for (const t of list) if (t) tokens.push(t);
+    }
+  } else {
+    // Самовывоз: только те, кто включил onPickup и действительно кладовщики
+    const qs = await db.collection("users").where("onPickup", "==", true).get();
+    for (const doc of qs.docs) {
+      const u = doc.data() || {};
+      if (normRole(u.role) !== "storekeeper") continue; // защита от широкой рассылки
+      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
+      for (const t of list) if (t) tokens.push(t);
+    }
   }
 
-  // выкидываем токены автора, чтобы он сам не получил пуш
+  // Дедуп токенов
+  tokens = [...new Set(tokens)];
+
+  // Исключаем автора
   if (authorUid) {
-    const ad = await db.collection("users").doc(authorUid).get();
-    const au = ad.data() || {};
-    (Array.isArray(au.fcmTokens) ? au.fcmTokens : []).forEach(t => tokens.delete(t));
+    const au = await getUserById(db, authorUid);
+    const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
+    tokens = tokens.filter(t => !authorTokens.has(t));
   }
 
-  return [...tokens];
+  return tokens;
 }
 
 export default async function handler(req, res) {
@@ -52,7 +85,7 @@ export default async function handler(req, res) {
     if (!taskId) return res.status(400).send("taskId required");
 
     // опционально: можно передать "uid1,uid2"
-    const rawAssignees = (req.body?.assigneeIds || "").trim();
+    const rawAssignees = String(req.body?.assigneeIds || "").trim();
     let assigneeIds = rawAssignees
       ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
       : [];
@@ -60,42 +93,24 @@ export default async function handler(req, res) {
     initAdmin();
     const db = admin.firestore();
 
-    // читаем задачу (нужно и для получателей, и для текста уведомления)
+    // читаем задачу (и для получателей, и для текста уведомления)
     const snap = await db.collection("tasks").doc(taskId).get();
     if (!snap.exists) return res.status(404).send("task not found");
     const task = snap.data() || {};
 
     // если не пришли получатели — берём из самой задачи
     if (!assigneeIds.length) {
-      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds;
-      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees;
+      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
+      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees.filter(Boolean);
     }
 
-    // получаем список токенов
-    let tokens = [];
-    if (assigneeIds.length) {
-      tokens = await collectAssigneeTokens(db, assigneeIds, task.creatorId || task.authorUid);
-    } else {
-      // самовывоз → всем кладовщикам, кроме автора
-      console.log("📦 No assigneeIds → sending to all storekeepers (pickup mode)");
-      const roles = ["кладовщик", "Кладовщик", "storekeeper", "kladovshik"];
-      const qs = await db.collection("users").whereIn("role", roles).get();
-      const bag = [];
-      qs.docs.forEach(doc => {
-        const u = doc.data() || {};
-        (Array.isArray(u.fcmTokens) ? u.fcmTokens : []).forEach(t => t && bag.push(t));
-      });
-      tokens = [...new Set(bag)];
-      if (task.creatorId) {
-        const ad = await db.collection("users").doc(task.creatorId).get();
-        const au = ad.data() || {};
-        (Array.isArray(au.fcmTokens) ? au.fcmTokens : []).forEach(t => {
-          tokens = tokens.filter(x => x !== t);
-        });
-      }
-    }
+    const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
+
+    // получаем список токенов по новым правилам
+    const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
 
     if (!tokens.length) {
+      console.log("ℹ️ No target tokens resolved.");
       return res.status(200).json({ sent: 0, reason: "no tokens" });
     }
 
@@ -135,4 +150,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: e.message });
   }
 }
-
