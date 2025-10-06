@@ -23,7 +23,7 @@ function initAdmin() {
   return app;
 }
 
-// --- utils ---
+// --- helpers ---
 function normRole(role) {
   const s = String(role || "").toLowerCase().trim();
   if (["кладовщик", "кладовщица", "storekeeper", "kladovshik", "кладовщик склада"].includes(s)) return "storekeeper";
@@ -38,41 +38,47 @@ async function getUserById(db, uid) {
 }
 
 /**
- * Возвращает массив FCM-токенов получателей по правилам:
- * - если есть assigneeIds → пуш ТОЛЬКО им;
- * - если assigneeIds пуст (самовывоз) → всем, у кого onPickup==true И роль кладовщика;
- * - автор исключается всегда.
+ * Возвращает массив FCM-токенов по правилам:
+ * 1) Если есть assigneeIds → пуш только им.
+ * 2) Если нет assigneeIds → самовывоз → пуш тем, у кого onPickup==true и роль кладовщика.
+ * 3) Автор всегда исключается.
  */
 async function collectTargetTokens({ db, assigneeIds, authorUid }) {
   let tokens = [];
+  const pickedUsers = [];
 
   if (Array.isArray(assigneeIds) && assigneeIds.length) {
-    // Явные исполнители
+    console.log("🎯 Mode: explicit assignees", assigneeIds);
     for (const uid of assigneeIds) {
       const u = await getUserById(db, uid);
+      pickedUsers.push({ uid, role: u.role, onPickup: u.onPickup, tokenCount: (u.fcmTokens || []).length });
       const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
       for (const t of list) if (t) tokens.push(t);
     }
   } else {
-    // Самовывоз: только те, кто включил onPickup и действительно кладовщики
+    console.log("📦 Mode: pickup (no assignees) — filtering by onPickup==true AND role=storekeeper");
     const qs = await db.collection("users").where("onPickup", "==", true).get();
     for (const doc of qs.docs) {
       const u = doc.data() || {};
-      if (normRole(u.role) !== "storekeeper") continue; // защита от широкой рассылки
+      if (normRole(u.role) !== "storekeeper") continue;
+      pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
       const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
       for (const t of list) if (t) tokens.push(t);
     }
   }
 
-  // Дедуп токенов
+  // дедуп
   tokens = [...new Set(tokens)];
 
-  // Исключаем автора
+  // исключаем автора
   if (authorUid) {
     const au = await getUserById(db, authorUid);
     const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
     tokens = tokens.filter(t => !authorTokens.has(t));
   }
+
+  console.log("👥 Picked users:", pickedUsers);
+  console.log("🎫 Tokens resolved:", tokens.length);
 
   return tokens;
 }
@@ -84,7 +90,7 @@ export default async function handler(req, res) {
     const taskId = (req.body?.taskId || "").trim();
     if (!taskId) return res.status(400).send("taskId required");
 
-    // опционально: можно передать "uid1,uid2"
+    // может прийти "uid1,uid2"
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
     let assigneeIds = rawAssignees
       ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
@@ -93,7 +99,7 @@ export default async function handler(req, res) {
     initAdmin();
     const db = admin.firestore();
 
-    // читаем задачу (и для получателей, и для текста уведомления)
+    // читаем задачу
     const snap = await db.collection("tasks").doc(taskId).get();
     if (!snap.exists) return res.status(404).send("task not found");
     const task = snap.data() || {};
@@ -106,21 +112,23 @@ export default async function handler(req, res) {
 
     const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
 
-    // получаем список токенов по новым правилам
+    console.log("🧾 Task", { taskId, authorUid, assigneeIds });
+
+    // получаем токены по новым правилам
     const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
 
     if (!tokens.length) {
-      console.log("ℹ️ No target tokens resolved.");
+      console.log("ℹ️ No tokens found — notification skipped.");
       return res.status(200).json({ sent: 0, reason: "no tokens" });
     }
 
-    // 🔹 ТЕКСТ УВЕДОМЛЕНИЯ ИЗ БАЗЫ
+    // текст уведомления
     const title = task.title ? String(task.title) : `Задача ${taskId}`;
     const body =
       (task.comment && String(task.comment)) ||
       (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
 
-    // 🔹 Собственно сообщение (кладём title/body и в notification, и в data)
+    // готовим уведомление
     const message = {
       notification: { title, body },
       android: {
@@ -137,9 +145,10 @@ export default async function handler(req, res) {
       },
     };
 
+    // отправляем
     const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
-    console.log(`📨 Sent: ${resp.successCount}, failed: ${resp.failureCount}, to ${tokens.length} tokens`);
+    console.log(`📨 Sent: ${resp.successCount}, failed: ${resp.failureCount}, tried: ${tokens.length}`);
     return res.status(200).json({
       sent: resp.successCount,
       failed: resp.failureCount,
