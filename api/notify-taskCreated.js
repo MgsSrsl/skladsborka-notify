@@ -1,4 +1,5 @@
-const admin = require("firebase-admin");
+// ESM-версия для Vercel ("type":"module")
+import admin from "firebase-admin";
 
 let app;
 
@@ -9,17 +10,21 @@ function initAdmin() {
 
     const sa = JSON.parse(raw);
 
-    // 🔹 Исправляем формат ключа (\\n → \n)
-    sa.private_key = sa.private_key.replace(/\\\\n/g, "\n");
+    // Нормализуем ключ: превращаем \n в реальные переводы строк
+    // (покрывает случаи с "\n" и "\\n")
+    sa.private_key = sa.private_key
+      .replace(/\\n/g, "\n")
+      .replace(/\r\n/g, "\n")
+      .trim();
 
-    console.log("🔍 private_key starts with:", sa.private_key.slice(0, 30));
+    console.log("🔍 private_key starts:", sa.private_key.slice(0, 30));
 
     app = admin.initializeApp({
       credential: admin.credential.cert(sa),
       projectId: sa.project_id,
     });
 
-    console.log("✅ Firebase initialized for:", sa.project_id);
+    console.log("✅ Firebase initialized:", sa.project_id);
   }
   return app;
 }
@@ -35,20 +40,17 @@ async function collectAssigneeTokens(db, task) {
   for (const uid of assigneeIds) {
     const snap = await db.collection("users").doc(uid).get();
     const u = snap.data() || {};
-    const arr = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
-    arr.forEach(t => t && tokens.add(t));
+    (Array.isArray(u.fcmTokens) ? u.fcmTokens : []).forEach(t => t && tokens.add(t));
   }
-
   if (task.authorUid) {
     const ad = await db.collection("users").doc(task.authorUid).get();
     const au = ad.data() || {};
-    const at = Array.isArray(au.fcmTokens) ? au.fcmTokens : [];
-    at.forEach(t => tokens.delete(t));
+    (Array.isArray(au.fcmTokens) ? au.fcmTokens : []).forEach(t => tokens.delete(t));
   }
   return [...tokens];
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
@@ -91,4 +93,5 @@ module.exports = async function handler(req, res) {
     console.error("🔥 Server error:", e);
     return res.status(500).json({ error: e.message });
   }
-};
+}
+
