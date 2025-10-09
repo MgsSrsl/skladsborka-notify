@@ -1,152 +1,161 @@
-// /api/cloudinary-delete.ts
-// Без импорта @vercel/node — оставим any, чтобы не тянуть пакет типов
-import { v2 as cloudinary } from 'cloudinary'
+// /api/notify-taskCreated.js  (ESM, "type":"module")
+import admin from "firebase-admin";
 
-/** ---------- Cloudinary config (универсально) ---------- */
-const hasUrl =
-  typeof process !== 'undefined' &&
-  !!process.env.CLOUDINARY_URL
+let app;
 
-const hasTriple =
-  typeof process !== 'undefined' &&
-  !!process.env.CLOUDINARY_CLOUD_NAME &&
-  !!process.env.CLOUDINARY_API_KEY &&
-  !!process.env.CLOUDINARY_API_SECRET
+function initAdmin() {
+  if (app) return app;
 
-if (hasUrl) {
-  cloudinary.config(process.env.CLOUDINARY_URL!)
-} else if (hasTriple) {
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME!,
-    api_key: process.env.CLOUDINARY_API_KEY!,
-    api_secret: process.env.CLOUDINARY_API_SECRET!,
-  })
-}
-cloudinary.config({ secure: true })
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
 
-/** ---- Утилита: аккуратный парсер тела из Postman/curl ---- */
-function parseBody(req: any): any {
-  const ctype = (req.headers?.['content-type'] || '').toLowerCase()
-  const raw = req.body
-  if (!raw) return {}
+  const sa = JSON.parse(raw);
+  sa.private_key = sa.private_key
+    .replace(/\\n/g, "\n")
+    .replace(/\r\n/g, "\n")
+    .trim();
 
-  if (typeof raw === 'object') {
-    // JSON уже распарсен (application/json) или form-urlencoded собран в объект
-    return raw
-  }
-  if (typeof raw === 'string') {
-    if (ctype.includes('application/json')) {
-      try { return JSON.parse(raw) } catch { return {} }
-    }
-    if (ctype.includes('application/x-www-form-urlencoded')) {
-      const obj: Record<string, string> = {}
-      raw.split('&').forEach(p => {
-        const [k, v] = p.split('=')
-        if (k) obj[decodeURIComponent(k)] = decodeURIComponent(v || '')
-      })
-      return obj
-    }
-  }
-  return {}
+  app = admin.initializeApp({
+    credential: admin.credential.cert(sa),
+    projectId: sa.project_id,
+  });
+  console.log("✅ Firebase initialized:", sa.project_id);
+  return app;
 }
 
-/** ---------- Handler ---------- */
-export default async function handler(req: any, res: any) {
-  // Диагностический пинг: GET /api/cloudinary-delete?ping=1
-  if (req.method === 'GET' && (req.query?.ping === '1' || req.query?.ping === 'true')) {
-    try {
-      const cfgOk = hasUrl || hasTriple
-      const ping = cfgOk ? await (cloudinary as any).api.ping?.() : null
-      return res.status(200).json({
-        ok: true,
-        env: {
-          CLOUDINARY_URL: !!process.env.CLOUDINARY_URL,
-          CLOUDINARY_CLOUD_NAME: !!process.env.CLOUDINARY_CLOUD_NAME,
-          CLOUDINARY_API_KEY: !!process.env.CLOUDINARY_API_KEY,
-          CLOUDINARY_API_SECRET: !!process.env.CLOUDINARY_API_SECRET,
-        },
-        cfgOk,
-        ping: ping ?? 'no api.ping available'
-      })
-    } catch (e: any) {
-      return res.status(500).json({
-        ok: false,
-        where: 'ping',
-        error: e?.error?.message || e?.message || 'ping failed',
-        name: e?.name, http_code: e?.http_code
-      })
+// --- helpers ---
+function normRole(role) {
+  const s = String(role || "").toLowerCase().trim();
+  if (["кладовщик", "кладовщица", "storekeeper", "kladovshik", "кладовщик склада"].includes(s)) return "storekeeper";
+  if (["начальник", "head", "boss"].includes(s)) return "head";
+  if (["менеджер", "manager"].includes(s)) return "manager";
+  return s;
+}
+
+async function getUserById(db, uid) {
+  const snap = await db.collection("users").doc(uid).get();
+  return { id: uid, ...(snap.data() || {}) };
+}
+
+/**
+ * Возвращает массив FCM-токенов по правилам:
+ * 1) Если есть assigneeIds → пуш только им.
+ * 2) Если нет assigneeIds → самовывоз → пуш тем, у кого onPickup==true и роль кладовщика.
+ * 3) Автор всегда исключается.
+ */
+async function collectTargetTokens({ db, assigneeIds, authorUid }) {
+  let tokens = [];
+  const pickedUsers = [];
+
+  if (Array.isArray(assigneeIds) && assigneeIds.length) {
+    console.log("🎯 Mode: explicit assignees", assigneeIds);
+    for (const uid of assigneeIds) {
+      const u = await getUserById(db, uid);
+      pickedUsers.push({ uid, role: u.role, onPickup: u.onPickup, tokenCount: (u.fcmTokens || []).length });
+      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
+      for (const t of list) if (t) tokens.push(t);
+    }
+  } else {
+    console.log("📦 Mode: pickup (no assignees) — filtering by onPickup==true AND role=storekeeper");
+    const qs = await db.collection("users").where("onPickup", "==", true).get();
+    for (const doc of qs.docs) {
+      const u = doc.data() || {};
+      if (normRole(u.role) !== "storekeeper") continue;
+      pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
+      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
+      for (const t of list) if (t) tokens.push(t);
     }
   }
 
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed')
+  // дедуп
+  tokens = [...new Set(tokens)];
 
-  // Понятная ошибка, если конфиг не задан
-  if (!hasUrl && !hasTriple) {
-    return res.status(500).json({
-      error: 'Cloudinary config is missing. Set CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET in Vercel → Settings → Environment Variables. Then redeploy.',
-      have: {
-        CLOUDINARY_URL: !!process.env.CLOUDINARY_URL,
-        CLOUDINARY_CLOUD_NAME: !!process.env.CLOUDINARY_CLOUD_NAME,
-        CLOUDINARY_API_KEY: !!process.env.CLOUDINARY_API_KEY,
-        CLOUDINARY_API_SECRET: !!process.env.CLOUDINARY_API_SECRET,
-      },
-    })
+  // исключаем автора
+  if (authorUid) {
+    const au = await getUserById(db, authorUid);
+    const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
+    tokens = tokens.filter(t => !authorTokens.has(t));
   }
 
+  console.log("👥 Picked users:", pickedUsers);
+  console.log("🎫 Tokens resolved:", tokens.length);
+
+  return tokens;
+}
+
+export default async function handler(req, res) {
   try {
-    const body = parseBody(req)
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // A) publicIds: может прийти строкой "a,b" или массивом
-    const pubAny = body.publicIds as unknown
-    let publicIds: string[] | undefined
-    if (typeof pubAny === 'string') {
-      publicIds = pubAny.split(',').map(s => s.trim()).filter(Boolean)
-    } else if (Array.isArray(pubAny)) {
-      publicIds = pubAny.map(String).map(s => s.trim()).filter(Boolean)
+    const taskId = (req.body?.taskId || "").trim();
+    if (!taskId) return res.status(400).send("taskId required");
+
+    // может прийти "uid1,uid2"
+    const rawAssignees = String(req.body?.assigneeIds || "").trim();
+    let assigneeIds = rawAssignees
+      ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
+      : [];
+
+    initAdmin();
+    const db = admin.firestore();
+
+    // читаем задачу
+    const snap = await db.collection("tasks").doc(taskId).get();
+    if (!snap.exists) return res.status(404).send("task not found");
+    const task = snap.data() || {};
+
+    // если не пришли получатели — берём из самой задачи
+    if (!assigneeIds.length) {
+      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
+      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees.filter(Boolean);
     }
 
-    // B) taskId → удаление по префиксу
-    const taskId: string | undefined = body.taskId || body.taskid || body.taskID
+    const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
 
-    if ((!publicIds || publicIds.length === 0) && !taskId) {
-      return res.status(200).json({ deleted: 0, mode: 'noop' })
+    console.log("🧾 Task", { taskId, authorUid, assigneeIds });
+
+    // получаем токены по новым правилам
+    const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
+
+    if (!tokens.length) {
+      console.log("ℹ️ No tokens found — notification skipped.");
+      return res.status(200).json({ sent: 0, reason: "no tokens" });
     }
 
-    let deleted = 0
+    // текст уведомления
+    const title = task.title ? String(task.title) : `Задача ${taskId}`;
+    const body =
+      (task.comment && String(task.comment)) ||
+      (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
 
-    if (publicIds && publicIds.length > 0) {
-      const chunk = (arr: string[], n: number) =>
-        arr.reduce((a, _, i) => (i % n ? a[a.length - 1].push(arr[i]) : a.push([arr[i]]), a), [] as string[][])
+    // готовим уведомление
+    const message = {
+      notification: { title, body },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "tasks_channel",
+          clickAction: "com.example.skladsborka.OPEN_TASK",
+        },
+      },
+      data: {
+        taskId: String(taskId),
+        title,
+        body,
+      },
+    };
 
-      const chunks = chunk(publicIds, 80)
-      for (const ids of chunks) {
-        const r1 = await cloudinary.api.delete_resources(ids, { resource_type: 'image' })
-        const r2 = await cloudinary.api.delete_resources(ids, { resource_type: 'raw' })
-        const r3 = await cloudinary.api.delete_resources(ids, { resource_type: 'video' }).catch(() => ({ deleted: {} }))
-        deleted += Object.keys((r1 as any).deleted || {}).length
-        deleted += Object.keys((r2 as any).deleted || {}).length
-        deleted += Object.keys((r3 as any).deleted || {}).length
-      }
-      return res.status(200).json({ deleted, mode: 'byPublicIds' })
-    }
+    // отправляем
+    const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
-    if (taskId) {
-      const prefix = `tasks/${taskId}`
-      const r1 = await cloudinary.api.delete_resources_by_prefix(prefix, { resource_type: 'image' })
-      const r2 = await cloudinary.api.delete_resources_by_prefix(prefix, { resource_type: 'raw' })
-      const r3 = await cloudinary.api.delete_resources_by_prefix(prefix, { resource_type: 'video' }).catch(() => ({ deleted: {}, partial: false }))
-      deleted += (r1 as any).partial ? 0 : Object.values((r1 as any).deleted || {}).length
-      deleted += (r2 as any).partial ? 0 : Object.values((r2 as any).deleted || {}).length
-      deleted += (r3 as any).partial ? 0 : Object.values((r3 as any).deleted || {}).length
-      try { await cloudinary.api.delete_folder(prefix) } catch {}
-      return res.status(200).json({ deleted, mode: 'byTaskPrefix', prefix })
-    }
-
-    return res.status(200).json({ deleted, mode: 'unknown' })
-  } catch (e: any) {
-    return res.status(500).json({
-      error: e?.error?.message || e?.error?.error?.message || e?.message || 'Internal error',
-      name: e?.name, http_code: e?.http_code
-    })
+    console.log(`📨 Sent: ${resp.successCount}, failed: ${resp.failureCount}, tried: ${tokens.length}`);
+    return res.status(200).json({
+      sent: resp.successCount,
+      failed: resp.failureCount,
+      tokensTried: tokens.length,
+    });
+  } catch (e) {
+    console.error("🔥 Server error:", e);
+    return res.status(500).json({ error: e.message });
   }
 }
