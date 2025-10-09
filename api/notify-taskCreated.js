@@ -135,6 +135,8 @@ export default async function handler(req, res) {
         priority: "high",
         notification: {
           channelId: "tasks_channel",
+          icon: "ic_stat_sklad",      // ✅ иконка из res/drawable (без расширения)
+          color: "#B71C1C",           // ✅ красный акцент (HEX)
           clickAction: "com.example.skladsborka.OPEN_TASK",
         },
       },
@@ -144,6 +146,8 @@ export default async function handler(req, res) {
         body,
       },
     };
+
+    console.log("📤 Message payload:", JSON.stringify(message, null, 2));
 
     // отправляем
     const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
