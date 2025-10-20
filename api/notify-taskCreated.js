@@ -56,7 +56,7 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
       for (const t of list) if (t) tokens.push(t);
     }
   } else {
-    console.log("📦 Mode: pickup (no assignees) — filtering by onPickup==true AND role=storekeeper");
+    console.log("📦 Mode: pickup (no assignees) — filtering by onPickup==true AND role=storekeeper, head");
     const qs = await db.collection("users").where("onPickup", "==", true).get();
     for (const doc of qs.docs) {
       const u = doc.data() || {};
