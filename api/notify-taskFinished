@@ -1,0 +1,52 @@
+// /api/notify-taskFinished.js
+import admin from "firebase-admin";
+let app;
+function initAdmin(){ /* как в notify-taskCreated */ }
+
+export default async function handler(req, res) {
+  try {
+    initAdmin();
+    const { taskId } = req.method === "POST" ? req.body : req.query;
+    if (!taskId) return res.status(400).send("Missing taskId");
+
+    const db = admin.firestore();
+    const snap = await db.collection("tasks").doc(taskId).get();
+    if (!snap.exists) return res.status(404).send("task not found");
+
+    const task = snap.data();
+    const title = task.title || "Без названия";
+    const creatorId = task.creatorId;
+    const takenByName = task.takenByName || (task.assigneeNames?.[0]) || "кладовщик";
+
+    // получатели: создатель
+    const users = [];
+    if (creatorId) {
+      const u = await db.collection("users").doc(creatorId).get();
+      if (u.exists) users.push(u.data());
+    }
+
+    // (опционально) добросить всех менеджеров/начальников:
+    // const mgrs = await db.collection("users")
+    //   .where("role", "in", ["manager", "Менеджер", "head", "Начальник"]).get();
+    // mgrs.forEach(d => users.push(d.data()));
+
+    // собрать токены
+    const tokens = [...new Set(users.flatMap(u => u.fcmTokens || []))].filter(Boolean);
+    if (tokens.length === 0) return res.status(200).send("no tokens");
+
+    const payload = {
+      tokens,
+      notification: {
+        title: "Задача завершена",
+        body: `«${title}» выполнена (${takenByName})`,
+      },
+      data: { taskId }
+    };
+
+    const out = await admin.messaging().sendEachForMulticast(payload);
+    res.status(200).json({ ok: true, sent: out.successCount, failed: out.failureCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).send(e.message || "error");
+  }
+}
