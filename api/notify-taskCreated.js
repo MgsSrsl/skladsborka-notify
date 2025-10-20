@@ -56,21 +56,23 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
       for (const t of list) if (t) tokens.push(t);
     }
   } else {
-    console.log("📦 Mode: pickup (no assignees) — filtering by onPickup==true AND role=storekeeper, head");
+    // 🔁 Пикаем всех с onPickup == true И роли storekeeper ИЛИ head
+    console.log("📦 Mode: pickup (no assignees) — onPickup==true AND role in {storekeeper, head}");
     const qs = await db.collection("users").where("onPickup", "==", true).get();
     for (const doc of qs.docs) {
       const u = doc.data() || {};
-      if (normRole(u.role) !== "storekeeper" && role !== "head") continue;
+      const role = normRole(u.role);
+      if (role !== "storekeeper" && role !== "head") continue; // 👈 добавили head
       pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
       const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
       for (const t of list) if (t) tokens.push(t);
     }
   }
 
-  // дедуп
+  // дедуп токенов
   tokens = [...new Set(tokens)];
 
-  // исключаем автора
+  // исключаем автора (если нужно — можно отключить)
   if (authorUid) {
     const au = await getUserById(db, authorUid);
     const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
