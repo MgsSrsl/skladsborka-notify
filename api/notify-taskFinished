@@ -1,3 +1,4 @@
+// /api/notify-taskFinished.js
 import admin from "firebase-admin";
 
 let app;
@@ -17,23 +18,19 @@ function initAdmin() {
 export default async function handler(req, res) {
   try {
     initAdmin();
-    const method = req.method || "GET";
 
-    // ✅ читаем JSON тело
-    let taskId = req.query.taskId;
-    if (method === "POST" && !taskId) {
-      try {
-        const chunk = await new Promise((resolve, reject) => {
-          let data = "";
-          req.on("data", (c) => (data += c));
-          req.on("end", () => resolve(data));
-          req.on("error", reject);
-        });
-        if (chunk) {
-          const parsed = JSON.parse(chunk);
-          taskId = parsed.taskId;
-        }
-      } catch (_) {}
+    // читаем JSON тело
+    let taskId;
+    if (req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const bodyStr = Buffer.concat(chunks).toString();
+      if (bodyStr) {
+        const data = JSON.parse(bodyStr);
+        taskId = data.taskId;
+      }
+    } else {
+      taskId = req.query.taskId;
     }
 
     if (!taskId) return res.status(400).json({ ok: false, error: "Missing taskId" });
@@ -42,7 +39,7 @@ export default async function handler(req, res) {
     const doc = await db.collection("tasks").doc(taskId).get();
     if (!doc.exists) return res.status(404).json({ ok: false, error: "task not found" });
 
-    const task = doc.data() || {};
+    const task = doc.data();
     const title = task.title || "Без названия";
     const creatorId = task.creatorId;
     const takenByName = task.takenByName || task.assigneeNames?.[0] || "кладовщик";
@@ -50,21 +47,16 @@ export default async function handler(req, res) {
     const users = [];
     if (creatorId) {
       const u = await db.collection("users").doc(creatorId).get();
-      if (u.exists) users.push({ id: u.id, ...u.data() });
+      if (u.exists) users.push(u.data());
     }
 
     const tokens = [...new Set(users.flatMap(u => u.fcmTokens || []))].filter(Boolean);
+    console.log("[notify-taskFinished]", { taskId, creatorId, tokens: tokens.length });
 
-    // Полезные логи в проде
-    console.log("[notify-taskFinished] taskId:", taskId,
-                "creatorId:", creatorId,
-                "tokens:", tokens.length);
-
-    if (tokens.length === 0) {
+    if (tokens.length === 0)
       return res.status(200).json({ ok: true, sent: 0, info: "no tokens" });
-    }
 
-    const msg = {
+    const payload = {
       tokens,
       notification: {
         title: "Задача завершена",
@@ -73,11 +65,10 @@ export default async function handler(req, res) {
       data: { taskId },
     };
 
-    const out = await admin.messaging().sendEachForMulticast(msg);
-    console.log("[notify-taskFinished] result:", out.successCount, out.failureCount, out.responses?.map(r=>r.error?.message).filter(Boolean));
-    res.status(200).json({ ok: true, sent: out.successCount, failed: out.failureCount });
+    const result = await admin.messaging().sendEachForMulticast(payload);
+    res.status(200).json({ ok: true, sent: result.successCount, failed: result.failureCount });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: e.message || "error" });
+    res.status(500).json({ ok: false, error: e.message });
   }
 }
