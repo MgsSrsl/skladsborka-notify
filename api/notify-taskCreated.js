@@ -60,7 +60,7 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
     const qs = await db.collection("users").where("onPickup", "==", true).get();
     for (const doc of qs.docs) {
       const u = doc.data() || {};
-      if (normRole(u.role) !== "storekeeper") continue;
+      if (normRole(u.role) !== "storekeeper" && role !== "head") continue;
       pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
       const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
       for (const t of list) if (t) tokens.push(t);
