@@ -15,11 +15,42 @@ function initAdmin() {
   return app;
 }
 
+// формат YYYY-MM-DD (UTC)
+function ymd(date) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+async function findTaskDoc(db, taskId, daysBack = 30) {
+  // 0) если прислали ПОЛНЫЙ путь — сразу пробуем его
+  if (typeof taskId === "string" && taskId.includes("/")) {
+    const snap = await db.doc(taskId).get();
+    if (snap.exists) return snap;
+  }
+
+  // 1) корневая коллекция /tasks/<id>
+  let snap = await db.collection("tasks").doc(taskId).get();
+  if (snap.exists) return snap;
+
+  // 2) перебор архивов за N дней: /archives/YYYY-MM-DD/tasks/<id>
+  const today = new Date();
+  for (let i = 0; i <= daysBack; i++) {
+    const dt = new Date(today);
+    dt.setUTCDate(today.getUTCDate() - i);
+    const day = ymd(dt);
+    snap = await db.collection("archives").doc(day).collection("tasks").doc(taskId).get();
+    if (snap.exists) return snap;
+  }
+
+  return null;
+}
+
 export default async function handler(req, res) {
   try {
     initAdmin();
     const db = admin.firestore();
-    const FieldPath = admin.firestore.FieldPath;
 
     // --- taskId из POST JSON или query ---
     let taskId;
@@ -36,48 +67,28 @@ export default async function handler(req, res) {
     }
     if (!taskId) return res.status(400).json({ ok: false, error: "Missing taskId" });
 
-    // --- находим задачу: /tasks/<id> или archives/**/tasks/<id>, либо полный путь ---
-    let docSnap;
-    if (typeof taskId === "string" && taskId.includes("/")) {
-      // Прислали путь
-      docSnap = await db.doc(taskId).get();
-    } else {
-      // Сначала корневая коллекция
-      docSnap = await db.collection("tasks").doc(taskId).get();
-      // Если нет — ищем по всем подпапкам через collectionGroup
-      if (!docSnap.exists) {
-        const cg = await db
-          .collectionGroup("tasks")
-          .where(FieldPath.documentId(), "==", taskId)
-          .limit(1)
-          .get();
-        if (!cg.empty) docSnap = cg.docs[0];
-      }
-    }
-    if (!docSnap || !docSnap.exists) {
-      return res.status(404).json({ ok: false, error: "task not found" });
-    }
+    // --- находим задачу ---
+    const docSnap = await findTaskDoc(db, taskId, 60); // ищем до 60 дней назад
+    if (!docSnap) return res.status(404).json({ ok: false, error: "task not found" });
 
     const task = docSnap.data() || {};
     const title = task.title || "Без названия";
     const takenByName = task.takenByName || task.assigneeNames?.[0] || "кладовщик";
 
-    // --- получатели: ТОЛЬКО менеджеры (без head) ---
+    // --- получатели: ТОЛЬКО менеджеры ---
     const roleValues = ["manager", "Manager", "менеджер", "Менеджер"];
-    const mgrs = await db.collection("users")
-      .where("role", "in", roleValues)
-      .get();
+    const mgrs = await db.collection("users").where("role", "in", roleValues).get();
 
     const users = [];
     mgrs.forEach(d => users.push({ id: d.id, ...d.data() }));
 
-    // Собираем токены и карту владельцев токенов (для очистки битых)
+    // сбор токенов и владельцев токенов
     const tokens = [];
     const tokenOwner = {};
     for (const u of users) {
       const tks = (u.fcmTokens || []).filter(Boolean);
       for (const t of tks) {
-        if (!tokenOwner[t]) { // дедуп
+        if (!tokenOwner[t]) {
           tokenOwner[t] = u.id;
           tokens.push(t);
         }
@@ -108,33 +119,31 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, sent: 0, info: "no tokens" });
     }
 
-    // --- отправка пуша ---
+    // --- отправляем пуш ---
     const payload = {
       tokens,
       notification: {
         title: "Задача завершена",
         body: `«${title}» выполнена (${takenByName})`,
       },
-      data: { taskId: String(taskId) },
+      data: { taskId: String(docSnap.id) }, // отправляем короткий id
     };
 
     const out = await admin.messaging().sendEachForMulticast(payload);
 
-    // лог ошибок и очистка битых токенов у соответствующих менеджеров
+    // очистка битых токенов
     const errors = out.responses
       .map((r, i) => (r.error ? { token: tokens[i], error: r.error.message } : null))
       .filter(Boolean);
 
     if (errors.length) {
-      console.log("[notify-taskFinished] failures:", errors.length, errors.map(e => e.error).slice(0, 3));
       const toRemoveByUser = {};
       const badRe = /registration-token|NotRegistered|Unregistered|MismatchSenderId|InvalidToken/i;
       for (const e of errors) {
         if (badRe.test(e.error)) {
           const uid = tokenOwner[e.token];
           if (uid) {
-            toRemoveByUser[uid] = toRemoveByUser[uid] || [];
-            toRemoveByUser[uid].push(e.token);
+            (toRemoveByUser[uid] ||= []).push(e.token);
           }
         }
       }
@@ -145,7 +154,7 @@ export default async function handler(req, res) {
           });
           console.log("[notify-taskFinished] removed bad tokens for", uid, list.length);
         } catch (err) {
-          console.warn("[notify-taskFinished] failed to cleanup tokens for", uid, err?.message);
+          console.warn("[notify-taskFinished] cleanup failed for", uid, err?.message);
         }
       }
     }
