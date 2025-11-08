@@ -1,169 +1,171 @@
-// /api/notify-taskCreated.js  (ESM, "type":"module")
+// /api/notify-taskFinished.js
 import admin from "firebase-admin";
 
 let app;
-
 function initAdmin() {
   if (app) return app;
-
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
   if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
-
   const sa = JSON.parse(raw);
-  sa.private_key = sa.private_key
-    .replace(/\\n/g, "\n")
-    .replace(/\r\n/g, "\n")
-    .trim();
-
+  sa.private_key = sa.private_key.replace(/\\n/g, "\n").trim();
   app = admin.initializeApp({
     credential: admin.credential.cert(sa),
     projectId: sa.project_id,
   });
-  console.log("✅ Firebase initialized:", sa.project_id);
   return app;
 }
 
-// --- helpers ---
-function normRole(role) {
-  const s = String(role || "").toLowerCase().trim();
-  if (["кладовщик", "кладовщица", "storekeeper", "kladovshik", "кладовщик склада"].includes(s)) return "storekeeper";
-  if (["начальник", "head", "boss"].includes(s)) return "head";
-  if (["менеджер", "manager"].includes(s)) return "manager";
-  return s;
+// формат YYYY-MM-DD (UTC)
+function ymd(date) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
-async function getUserById(db, uid) {
-  const snap = await db.collection("users").doc(uid).get();
-  return { id: uid, ...(snap.data() || {}) };
-}
-
-/**
- * Возвращает массив FCM-токенов по правилам:
- * 1) Если есть assigneeIds → пуш только им.
- * 2) Если нет assigneeIds → pickup → onPickup==true и роль storekeeper/head.
- * 3) Автор всегда исключается.
- */
-async function collectTargetTokens({ db, assigneeIds, authorUid }) {
-  let tokens = [];
-  const pickedUsers = [];
-
-  if (Array.isArray(assigneeIds) && assigneeIds.length) {
-    console.log("🎯 Mode: explicit assignees", assigneeIds);
-    for (const uid of assigneeIds) {
-      const u = await getUserById(db, uid);
-      pickedUsers.push({ uid, role: u.role, onPickup: u.onPickup, tokenCount: (u.fcmTokens || []).length });
-      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
-      for (const t of list) if (t) tokens.push(t);
-    }
-  } else {
-    console.log("📦 Mode: pickup (no assignees) — onPickup==true AND role in {storekeeper, head}");
-    const qs = await db.collection("users").where("onPickup", "==", true).get();
-    for (const doc of qs.docs) {
-      const u = doc.data() || {};
-      const role = normRole(u.role);
-      if (role !== "storekeeper" && role !== "head") continue;
-      pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
-      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
-      for (const t of list) if (t) tokens.push(t);
-    }
+async function findTaskDoc(db, taskId, daysBack = 30) {
+  // 0) если прислали ПОЛНЫЙ путь — сразу пробуем его
+  if (typeof taskId === "string" && taskId.includes("/")) {
+    const snap = await db.doc(taskId).get();
+    if (snap.exists) return snap;
   }
 
-  tokens = [...new Set(tokens)];
+  // 1) корневая коллекция /tasks/<id>
+  let snap = await db.collection("tasks").doc(taskId).get();
+  if (snap.exists) return snap;
 
-  if (authorUid) {
-    const au = await getUserById(db, authorUid);
-    const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
-    tokens = tokens.filter(t => !authorTokens.has(t));
+  // 2) перебор архивов за N дней: /archives/YYYY-MM-DD/tasks/<id>
+  const today = new Date();
+  for (let i = 0; i <= daysBack; i++) {
+    const dt = new Date(today);
+    dt.setUTCDate(today.getUTCDate() - i);
+    const day = ymd(dt);
+    snap = await db.collection("archives").doc(day).collection("tasks").doc(taskId).get();
+    if (snap.exists) return snap;
   }
 
-  console.log("👥 Picked users:", pickedUsers);
-  console.log("🎫 Tokens resolved:", tokens.length);
-
-  return tokens;
+  return null;
 }
 
-// === main handler ===
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
-
-    const taskId = (req.body?.taskId || "").trim();
-    if (!taskId) return res.status(400).send("taskId required");
-
-    const rawAssignees = String(req.body?.assigneeIds || "").trim();
-    let assigneeIds = rawAssignees
-      ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
-      : [];
-
     initAdmin();
     const db = admin.firestore();
 
-    const snap = await db.collection("tasks").doc(taskId).get();
-    if (!snap.exists) return res.status(404).send("task not found");
-    const task = snap.data() || {};
+    // --- taskId из POST JSON или query ---
+    let taskId;
+    if (req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const bodyStr = Buffer.concat(chunks).toString();
+      if (bodyStr) {
+        const data = JSON.parse(bodyStr);
+        taskId = data.taskId;
+      }
+    } else {
+      taskId = req.query.taskId;
+    }
+    if (!taskId) return res.status(400).json({ ok: false, error: "Missing taskId" });
 
-    if (!assigneeIds.length) {
-      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
-      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees.filter(Boolean);
+    // --- находим задачу ---
+    const docSnap = await findTaskDoc(db, taskId, 60); // ищем до 60 дней назад
+    if (!docSnap) return res.status(404).json({ ok: false, error: "task not found" });
+
+    const task = docSnap.data() || {};
+    const title = task.title || "Без названия";
+    const takenByName = task.takenByName || task.assigneeNames?.[0] || "кладовщик";
+
+    // --- получатели: ТОЛЬКО менеджеры ---
+    const roleValues = ["manager", "Manager", "менеджер", "Менеджер"];
+    const mgrs = await db.collection("users").where("role", "in", roleValues).get();
+
+    const users = [];
+    mgrs.forEach(d => users.push({ id: d.id, ...d.data() }));
+
+    // сбор токенов и владельцев токенов
+    const tokens = [];
+    const tokenOwner = {};
+    for (const u of users) {
+      const tks = (u.fcmTokens || []).filter(Boolean);
+      for (const t of tks) {
+        if (!tokenOwner[t]) {
+          tokenOwner[t] = u.id;
+          tokens.push(t);
+        }
+      }
     }
 
-    const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
+    const debug = String(req.query?.debug || "").trim() === "1";
+    console.log("[notify-taskFinished]", {
+      taskId,
+      path: docSnap.ref.path,
+      managers: users.length,
+      tokens: tokens.length,
+    });
 
-    console.log("🧾 Task", { taskId, authorUid, assigneeIds });
-
-    const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
-
-    if (!tokens.length) {
-      console.log("ℹ️ No tokens found — notification skipped.");
-      return res.status(200).json({ sent: 0, reason: "no tokens" });
-    }
-
-    const title = task.title ? String(task.title) : `Задача ${taskId}`;
-    const body =
-      (task.comment && String(task.comment)) ||
-      (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
-
-    // === ВАЖНО: формируем корректный message ===
-    const now = Date.now();
-    const message = {
-      notification: { title, body },
-      android: {
-        priority: "high",
-        ttl: 259200000,                   // ✅ 3 дня (мс) для admin SDK
-        notification: {
-          channelId: "tasks_channel",
-          icon: "ic_stat_sklad",
-          color: "#B71C1C",
-          clickAction: "com.example.skladsborka.OPEN_TASK",
-        },
-      },
-      data: {
-        taskId: String(taskId),
+    if (debug) {
+      return res.status(200).json({
+        ok: true,
+        mode: "debug",
+        taskId,
+        path: docSnap.ref.path,
         title,
-        body,
-        createdAt: String(now),
-        nonce: `${taskId}:${now}`,
-      },
-    };
-
-    console.log("📤 Message payload:", JSON.stringify({ tokensCount: tokens.length, message }, null, 2));
-
-    const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
-
-    console.log(`📨 Sent: ${resp.successCount}, failed: ${resp.failureCount}, tried: ${tokens.length}`);
-    if (resp.failureCount) {
-      resp.responses.forEach((r, i) => {
-        if (!r.success) console.error("  ✖ token failed:", tokens[i], r.error?.code, r.error?.message);
+        managersCount: users.length,
+        tokensCount: tokens.length,
       });
     }
 
+    if (!tokens.length) {
+      return res.status(200).json({ ok: true, sent: 0, info: "no tokens" });
+    }
+
+    // --- отправляем пуш ---
+    const payload = {
+      tokens,
+      notification: {
+        title: "Задача завершена",
+        body: `«${title}» выполнена (${takenByName})`,
+      },
+      data: { taskId: String(docSnap.id) }, // отправляем короткий id
+    };
+
+    const out = await admin.messaging().sendEachForMulticast(payload);
+
+    // очистка битых токенов
+    const errors = out.responses
+      .map((r, i) => (r.error ? { token: tokens[i], error: r.error.message } : null))
+      .filter(Boolean);
+
+    if (errors.length) {
+      const toRemoveByUser = {};
+      const badRe = /registration-token|NotRegistered|Unregistered|MismatchSenderId|InvalidToken/i;
+      for (const e of errors) {
+        if (badRe.test(e.error)) {
+          const uid = tokenOwner[e.token];
+          if (uid) {
+            (toRemoveByUser[uid] ||= []).push(e.token);
+          }
+        }
+      }
+      for (const [uid, list] of Object.entries(toRemoveByUser)) {
+        try {
+          await db.collection("users").doc(uid).update({
+            fcmTokens: admin.firestore.FieldValue.arrayRemove(...list),
+          });
+          console.log("[notify-taskFinished] removed bad tokens for", uid, list.length);
+        } catch (err) {
+          console.warn("[notify-taskFinished] cleanup failed for", uid, err?.message);
+        }
+      }
+    }
+
     return res.status(200).json({
-      sent: resp.successCount,
-      failed: resp.failureCount,
-      tokensTried: tokens.length,
+      ok: true,
+      sent: out.successCount,
+      failed: out.failureCount,
     });
   } catch (e) {
-    console.error("🔥 Server error:", e);
-    return res.status(500).json({ error: e.message });
+    console.error(e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 }
