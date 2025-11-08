@@ -128,7 +128,6 @@ export default async function handler(req, res) {
     const message = {
       notification: { title, body },
       android: {
-        collapseKey: `task:${taskId}`,    // ✅ схлопывание по задаче
         priority: "high",
         ttl: 259200000,                   // ✅ 3 дня (мс) для admin SDK
         notification: {
