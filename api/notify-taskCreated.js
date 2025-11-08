@@ -2,7 +2,6 @@
 import admin from "firebase-admin";
 
 let app;
-
 function initAdmin() {
   if (app) return app;
 
@@ -10,10 +9,7 @@ function initAdmin() {
   if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
 
   const sa = JSON.parse(raw);
-  sa.private_key = sa.private_key
-    .replace(/\\n/g, "\n")
-    .replace(/\r\n/g, "\n")
-    .trim();
+  sa.private_key = sa.private_key.replace(/\\n/g, "\n").replace(/\r\n/g, "\n").trim();
 
   app = admin.initializeApp({
     credential: admin.credential.cert(sa),
@@ -40,15 +36,14 @@ async function getUserById(db, uid) {
 /**
  * Возвращает массив FCM-токенов по правилам:
  * 1) Если есть assigneeIds → пуш только им.
- * 2) Если нет assigneeIds → самовывоз → пуш тем, у кого onPickup==true и роль кладовщика.
- * 3) Автор всегда исключается.
+ * 2) Если нет → всем с onPickup==true среди ролей storekeeper/head.
+ * 3) Автор исключается.
  */
 async function collectTargetTokens({ db, assigneeIds, authorUid }) {
   let tokens = [];
   const pickedUsers = [];
 
   if (Array.isArray(assigneeIds) && assigneeIds.length) {
-    console.log("🎯 Mode: explicit assignees", assigneeIds);
     for (const uid of assigneeIds) {
       const u = await getUserById(db, uid);
       pickedUsers.push({ uid, role: u.role, onPickup: u.onPickup, tokenCount: (u.fcmTokens || []).length });
@@ -56,13 +51,11 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
       for (const t of list) if (t) tokens.push(t);
     }
   } else {
-    // 🔁 Пикаем всех с onPickup == true И роли storekeeper ИЛИ head
-    console.log("📦 Mode: pickup (no assignees) — onPickup==true AND role in {storekeeper, head}");
     const qs = await db.collection("users").where("onPickup", "==", true).get();
     for (const doc of qs.docs) {
       const u = doc.data() || {};
       const role = normRole(u.role);
-      if (role !== "storekeeper" && role !== "head") continue; // 👈 добавили head
+      if (role !== "storekeeper" && role !== "head") continue;
       pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
       const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
       for (const t of list) if (t) tokens.push(t);
@@ -72,16 +65,14 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
   // дедуп токенов
   tokens = [...new Set(tokens)];
 
-  // исключаем автора (если нужно — можно отключить)
+  // исключаем автора
   if (authorUid) {
     const au = await getUserById(db, authorUid);
     const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
     tokens = tokens.filter(t => !authorTokens.has(t));
   }
 
-  console.log("👥 Picked users:", pickedUsers);
-  console.log("🎫 Tokens resolved:", tokens.length);
-
+  console.log("👥 Picked users:", pickedUsers.length, "🎫 Tokens:", tokens.length);
   return tokens;
 }
 
@@ -89,14 +80,12 @@ export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    const taskId = (req.body?.taskId || "").trim();
+    const taskId = String(req.body?.taskId || "").trim();
     if (!taskId) return res.status(400).send("taskId required");
 
     // может прийти "uid1,uid2"
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
-    let assigneeIds = rawAssignees
-      ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
-      : [];
+    let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     initAdmin();
     const db = admin.firestore();
@@ -113,14 +102,12 @@ export default async function handler(req, res) {
     }
 
     const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
+    console.log("🧾 Task", { taskId, authorUid, assigneeIdsCount: assigneeIds.length });
 
-    console.log("🧾 Task", { taskId, authorUid, assigneeIds });
-
-    // получаем токены по новым правилам
+    // получаем токены
     const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
-
     if (!tokens.length) {
-      console.log("ℹ️ No tokens found — notification skipped.");
+      console.log("ℹ️ No tokens found — skip send");
       return res.status(200).json({ sent: 0, reason: "no tokens" });
     }
 
@@ -130,35 +117,29 @@ export default async function handler(req, res) {
       (task.comment && String(task.comment)) ||
       (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
 
-    // готовим уведомление
+    // ⚙️ data-only сообщение (без notification части)
     const message = {
-  
       android: {
         priority: "high",
-        notification: {
-          channelId: "tasks_channel",
-          icon: "ic_stat_sklad",      // ✅ иконка из res/drawable (без расширения)
-          color: "#B71C1C",           // ✅ красный акцент (HEX)
-          clickAction: "com.example.skladsborka.OPEN_TASK",
-        },
+        ttl: 24 * 60 * 60, // секунды
+        // collapseKey оставим пустым => не будет схлопываться очередь
       },
       data: {
+        type: "taskCreated",
         taskId: String(taskId),
         title,
         body,
       },
     };
-const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
-    console.log("📤 Message payload:", JSON.stringify(message, null, 2));
+    console.log("📤 Message (data-only):", { android: message.android, data: message.data });
 
-    // отправляем
-    const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
+    const sendResult = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
-    console.log(`📨 Sent: ${resp.successCount}, failed: ${resp.failureCount}, tried: ${tokens.length}`);
+    console.log(`📨 Sent: ${sendResult.successCount}, failed: ${sendResult.failureCount}, tried: ${tokens.length}`);
     return res.status(200).json({
-      sent: resp.successCount,
-      failed: resp.failureCount,
+      sent: sendResult.successCount,
+      failed: sendResult.failureCount,
       tokensTried: tokens.length,
     });
   } catch (e) {
