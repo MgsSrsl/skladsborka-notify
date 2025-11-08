@@ -132,7 +132,7 @@ export default async function handler(req, res) {
 
     // готовим уведомление
     const message = {
-      notification: { title, body },
+  
       android: {
         priority: "high",
         notification: {
@@ -148,6 +148,7 @@ export default async function handler(req, res) {
         body,
       },
     };
+const resp = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
     console.log("📤 Message payload:", JSON.stringify(message, null, 2));
 
