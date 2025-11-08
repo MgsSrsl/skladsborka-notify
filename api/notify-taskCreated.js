@@ -82,6 +82,7 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
   return tokens;
 }
 
+// === main handler ===
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
@@ -122,28 +123,27 @@ export default async function handler(req, res) {
       (task.comment && String(task.comment)) ||
       (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
 
-    // === ВАЖНО: формируем ОДИН объект message, без дублей/вклеек ===
+    // === ВАЖНО: формируем корректный message ===
     const now = Date.now();
     const message = {
       notification: { title, body },
       android: {
+        collapseKey: `task:${taskId}`,    // ✅ схлопывание по задаче
         priority: "high",
+        ttl: 259200000,                   // ✅ 3 дня (мс) для admin SDK
         notification: {
           channelId: "tasks_channel",
           icon: "ic_stat_sklad",
           color: "#B71C1C",
           clickAction: "com.example.skladsborka.OPEN_TASK",
         },
-        // Если захочешь — позже можно вернуть схлопывание по задаче:
-        // collapseKey: `task:${taskId}`,
-        // ttl: 259200000, // 3 дня, ЧИСЛО (мс) для admin SDK
       },
       data: {
         taskId: String(taskId),
         title,
         body,
-        createdAt: String(now), // безопасно, клиент читает
-        // nonce: `${taskId}:${now}`, // опционально
+        createdAt: String(now),
+        nonce: `${taskId}:${now}`,
       },
     };
 
