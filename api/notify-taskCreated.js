@@ -148,6 +148,26 @@ export default async function handler(req, res) {
         body,
       },
     };
+    const now = Date.now();                          // + добавили
+const message = {
+  notification: { title, body },                 // = без изменений
+  android: {
+    collapseKey: `task:${taskId}`,               // + ключ схлопывания по ЗАДАЧЕ
+    priority: "high",                            // = как было
+    // ttl: 259200000,                           // + (опционально) 3 дня; если SDK ругнётся — убери
+    notification: {
+      channelId: "tasks_channel",
+      icon: "ic_stat_sklad",
+      color: "#B71C1C",
+      clickAction: "com.example.skladsborka.OPEN_TASK",
+    },
+  },
+  data: {
+    taskId: String(taskId),
+    title,
+    body,
+    createdAt: String(now),                      // + время генерации пуша (мс)
+    nonce: `${taskId}:${now}`,                   // + уникальность сообщения
 
     console.log("📤 Message payload:", JSON.stringify(message, null, 2));
 
