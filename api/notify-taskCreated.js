@@ -136,7 +136,7 @@ const lastSent =
 
 if (lastSent && (now - lastSent) < 30000) {
   console.log("⛔ Duplicate request blocked (30 sec):", taskId);
-
+console.log("===== FINISHED =====", taskId);
   return res.status(200).json({
     skipped: true,
     reason: "30_sec_limit"
@@ -202,4 +202,4 @@ console.log("✅ notificationSent=true");
     return res.status(500).json({ error: e.message });
   }
 }
-console.log("===== FINISHED =====", taskId);
+
