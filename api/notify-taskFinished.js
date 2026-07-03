@@ -54,18 +54,19 @@ export default async function handler(req, res) {
 
     // --- taskId из POST JSON или query ---
     let taskId;
-    if (req.method === "POST") {
-      const taskId = req.body?.taskId || req.query.taskId;
-      const bodyStr = Buffer.concat(chunks).toString();
-      if (bodyStr) {
-        const data = JSON.parse(bodyStr);
-        taskId = data.taskId;
-      }
-    } else {
-      taskId = req.query.taskId;
-    }
-    if (!taskId) return res.status(400).json({ ok: false, error: "Missing taskId" });
 
+if (req.method === "POST") {
+  taskId = req.body?.taskId;
+} else {
+  taskId = req.query.taskId;
+}
+
+if (!taskId) {
+  return res.status(400).json({
+    ok: false,
+    error: "Missing taskId"
+  });
+}
     // --- находим задачу ---
     const docSnap = await findTaskDoc(db, taskId, 60); // ищем до 60 дней назад
     if (!docSnap) return res.status(404).json({ ok: false, error: "task not found" });
