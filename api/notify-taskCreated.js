@@ -78,6 +78,13 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
 
 export default async function handler(req, res) {
   try {
+    console.log("===== REQUEST =====");
+console.log({
+  time: new Date().toISOString(),
+  taskId: req.body?.taskId,
+  ua: req.headers["user-agent"],
+  ip: req.headers["x-forwarded-for"],
+});
     console.log("==========================================");
 console.log("NEW REQUEST");
 console.log("Time:", new Date().toISOString());
