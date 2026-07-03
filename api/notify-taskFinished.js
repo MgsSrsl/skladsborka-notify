@@ -55,8 +55,7 @@ export default async function handler(req, res) {
     // --- taskId из POST JSON или query ---
     let taskId;
     if (req.method === "POST") {
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
+      const taskId = req.body?.taskId || req.query.taskId;
       const bodyStr = Buffer.concat(chunks).toString();
       if (bodyStr) {
         const data = JSON.parse(bodyStr);
