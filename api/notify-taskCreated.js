@@ -1,4 +1,4 @@
-// /api/notify-taskCreated.js (ESM)
+// /api/notify-taskCreated.js  (ESM, "type":"module")
 import admin from "firebase-admin";
 
 let app;
@@ -9,193 +9,141 @@ function initAdmin() {
   if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
 
   const sa = JSON.parse(raw);
-  sa.private_key = sa.private_key.replace(/\\n/g, "\n").trim();
+  sa.private_key = sa.private_key.replace(/\\n/g, "\n").replace(/\r\n/g, "\n").trim();
 
   app = admin.initializeApp({
     credential: admin.credential.cert(sa),
     projectId: sa.project_id,
   });
-
-  console.log("✅ Firebase initialized");
+  console.log("✅ Firebase initialized:", sa.project_id);
   return app;
 }
 
+// --- helpers ---
 function normRole(role) {
   const s = String(role || "").toLowerCase().trim();
-  if (["кладовщик", "storekeeper", "kladovshik"].includes(s)) return "storekeeper";
+  if (["кладовщик", "кладовщица", "storekeeper", "kladovshik", "кладовщик склада"].includes(s)) return "storekeeper";
   if (["начальник", "head", "boss"].includes(s)) return "head";
   if (["менеджер", "manager"].includes(s)) return "manager";
   return s;
 }
 
-async function getUser(db, uid) {
+async function getUserById(db, uid) {
   const snap = await db.collection("users").doc(uid).get();
   return { id: uid, ...(snap.data() || {}) };
 }
 
-async function collectTokens({ db, assigneeIds, authorUid }) {
+/**
+ * Возвращает массив FCM-токенов по правилам:
+ * 1) Если есть assigneeIds → пуш только им.
+ * 2) Если нет → всем с onPickup==true среди ролей storekeeper/head.
+ * 3) Автор исключается.
+ */
+async function collectTargetTokens({ db, assigneeIds, authorUid }) {
   let tokens = [];
+  const pickedUsers = [];
 
-  for (const uid of assigneeIds) {
-    const u = await getUser(db, uid);
-    const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
-    tokens.push(...list);
+  if (Array.isArray(assigneeIds) && assigneeIds.length) {
+    for (const uid of assigneeIds) {
+      const u = await getUserById(db, uid);
+      pickedUsers.push({ uid, role: u.role, onPickup: u.onPickup, tokenCount: (u.fcmTokens || []).length });
+      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
+      for (const t of list) if (t) tokens.push(t);
+    }
+  } else {
+    const qs = await db.collection("users").where("onPickup", "==", true).get();
+    for (const doc of qs.docs) {
+      const u = doc.data() || {};
+      const role = normRole(u.role);
+      if (role !== "storekeeper" && role !== "head") continue;
+      pickedUsers.push({ uid: doc.id, role: u.role, onPickup: true, tokenCount: (u.fcmTokens || []).length });
+      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
+      for (const t of list) if (t) tokens.push(t);
+    }
   }
 
-  // dedupe
+  // дедуп токенов
   tokens = [...new Set(tokens)];
 
-  // remove author tokens
+  // исключаем автора
   if (authorUid) {
-    const au = await getUser(db, authorUid);
-    const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens : []);
+    const au = await getUserById(db, authorUid);
+    const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
     tokens = tokens.filter(t => !authorTokens.has(t));
   }
 
+  console.log("👥 Picked users:", pickedUsers.length, "🎫 Tokens:", tokens.length);
   return tokens;
 }
 
 export default async function handler(req, res) {
-  const db = admin.firestore();
-
-const lockRef = db.collection("locks").doc(taskId);
-
-const lockSnap = await lockRef.get();
-if (lockSnap.exists) {
-  return res.status(200).json({
-    skipped: true,
-    reason: "locked"
-  });
-}
-
-await lockRef.set({
-  createdAt: Date.now()
-});
   try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method Not Allowed" });
-    }
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+
+    const taskId = String(req.body?.taskId || "").trim();
+    if (!taskId) return res.status(400).send("taskId required");
+
+    // может прийти "uid1,uid2"
+    const rawAssignees = String(req.body?.assigneeIds || "").trim();
+    let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     initAdmin();
     const db = admin.firestore();
 
-    const taskId = String(req.body?.taskId || "").trim();
-    if (!taskId) return res.status(400).json({ error: "taskId required" });
+    // читаем задачу
+    const snap = await db.collection("tasks").doc(taskId).get();
+    if (!snap.exists) return res.status(404).send("task not found");
+    const task = snap.data() || {};
 
-    const assigneeIdsRaw = String(req.body?.assigneeIds || "");
-    let assigneeIds = assigneeIdsRaw
-      ? assigneeIdsRaw.split(",").map(s => s.trim()).filter(Boolean)
-      : [];
-
-    const taskRef = db.collection("tasks").doc(taskId);
-    const snap = await taskRef.get();
-
-    if (!snap.exists) {
-      return res.status(404).json({ error: "task not found" });
-    }
-
-    const task = snap.data();
-
-    const authorUid =
-      task.creatorId || task.authorUid || task.createdBy || "";
-
-    // =========================
-    // 🔥 ANTI DUPLICATE CORE
-    // =========================
-
-    if (task.pushSentAt || lockSnap.exists) {
-  return res.status(200).json({
-    skipped: true,
-    reason: "already_processed"
-  });
-}
-
-    // fallback: берём из задачи
+    // если не пришли получатели — берём из самой задачи
     if (!assigneeIds.length) {
-      assigneeIds =
-        task.assigneeIds ||
-        task.assignees ||
-        [];
+      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
+      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees.filter(Boolean);
     }
 
-    if (!assigneeIds.length) {
-      return res.status(200).json({
-        skipped: true,
-        reason: "no_assignees",
-      });
-    }
+    const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
+    console.log("🧾 Task", { taskId, authorUid, assigneeIdsCount: assigneeIds.length });
 
-    // anti spam log (global dedup)
-    const logId = `${taskId}_created`;
-    const logRef = db.collection("pushLogs").doc(logId);
-
-    const logSnap = await logRef.get();
-    if (logSnap.exists) {
-      return res.status(200).json({
-        skipped: true,
-        reason: "log_exists",
-      });
-    }
-
-    const tokens = await collectTokens({ db, assigneeIds, authorUid });
-
+    // получаем токены
+    const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
     if (!tokens.length) {
-      return res.status(200).json({
-        sent: 0,
-        reason: "no_tokens",
-      });
+      console.log("ℹ️ No tokens found — skip send");
+      return res.status(200).json({ sent: 0, reason: "no tokens" });
     }
 
+    // текст уведомления
     const title = task.title ? String(task.title) : `Задача ${taskId}`;
     const body =
-      task.comment ||
-      task.creatorName ||
-      "Новое задание";
+      (task.comment && String(task.comment)) ||
+      (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
 
+    // ⚙️ data-only сообщение (без notification части)
     const message = {
       android: {
         priority: "high",
-        ttl: 24 * 60 * 60,
+        ttl: 24 * 60 * 60, // секунды
+        // collapseKey оставим пустым => не будет схлопываться очередь
       },
       data: {
         type: "taskCreated",
-        taskId,
+        taskId: String(taskId),
         title,
         body,
       },
     };
 
-    const result = await admin.messaging().sendEachForMulticast({
-      tokens,
-      ...message,
-    });
+    console.log("📤 Message (data-only):", { android: message.android, data: message.data });
 
-    // =========================
-    // SAVE STATE (IMPORTANT)
-    // =========================
+    const sendResult = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
-    await taskRef.update({
-      pushSentAt: Date.now(),
-      pushSentSuccess: result.successCount,
-      pushSentFailed: result.failureCount,
-    });
-
-    await logRef.set({
-      taskId,
-      createdAt: Date.now(),
-      success: result.successCount,
-      failed: result.failureCount,
-    });
-
+    console.log(`📨 Sent: ${sendResult.successCount}, failed: ${sendResult.failureCount}, tried: ${tokens.length}`);
     return res.status(200).json({
-      sent: result.successCount,
-      failed: result.failureCount,
-      tokens: tokens.length,
-      status: "sent_once",
+      sent: sendResult.successCount,
+      failed: sendResult.failureCount,
+      tokensTried: tokens.length,
     });
-
   } catch (e) {
-    console.error("🔥 error:", e);
+    console.error("🔥 Server error:", e);
     return res.status(500).json({ error: e.message });
   }
 }
