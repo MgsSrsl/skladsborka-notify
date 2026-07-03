@@ -83,19 +83,22 @@ export default async function handler(req, res) {
     console.log("URL:", req.url);
     console.log("USER-AGENT:", req.headers["user-agent"]);
     console.log("BODY:", req.body);
+    
 
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   
 
     const taskId = String(req.body?.taskId || "").trim();
+    console.log("TASK ID:", taskId);
+console.log("ASSIGNEES RAW:", req.body?.assigneeIds);
     // может прийти "uid1,uid2"
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
     let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     initAdmin();
     const db = admin.firestore();
-
+console.log("READING TASK FROM FIRESTORE");
     // читаем задачу
     const snap = await db.collection("tasks").doc(taskId).get();
     if (!snap.exists) return res.status(404).send("task not found");
