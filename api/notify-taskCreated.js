@@ -78,11 +78,15 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
 
 export default async function handler(req, res) {
   try {
+    console.log("========== REQUEST ==========");
+    console.log("METHOD:", req.method);
+    console.log("URL:", req.url);
+    console.log("USER-AGENT:", req.headers["user-agent"]);
+    console.log("BODY:", req.body);
+
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
     const taskId = String(req.body?.taskId || "").trim();
-    if (!taskId) return res.status(400).send("taskId required");
-
     // может прийти "uid1,uid2"
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
     let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
