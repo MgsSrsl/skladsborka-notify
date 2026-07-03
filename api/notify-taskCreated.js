@@ -78,6 +78,23 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
 
 export default async function handler(req, res) {
   try {
+    console.log("==========================================");
+console.log("NEW REQUEST");
+console.log("Time:", new Date().toISOString());
+
+console.log({
+  ip:
+    req.headers["x-forwarded-for"] ||
+    req.headers["x-real-ip"],
+
+  ua: req.headers["user-agent"],
+
+  origin: req.headers["origin"],
+
+  referer: req.headers["referer"]
+});
+
+console.log("Body:", req.body);
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
     const taskId = String(req.body?.taskId || "").trim();
@@ -94,7 +111,30 @@ export default async function handler(req, res) {
     const snap = await db.collection("tasks").doc(taskId).get();
     if (!snap.exists) return res.status(404).send("task not found");
     const task = snap.data() || {};
+// ===== АНТИСПАМ =====
+const now = Date.now();
 
+if (task.notificationSent === true) {
+  console.log("⛔ Notification already sent for task:", taskId);
+  return res.status(200).json({
+    skipped: true,
+    reason: "already_sent"
+  });
+}
+
+const lastSent =
+  task.notificationSentAt?.toMillis?.() ||
+  task.notificationSentAt ||
+  0;
+
+if (lastSent && (now - lastSent) < 30000) {
+  console.log("⛔ Duplicate request blocked (30 sec):", taskId);
+
+  return res.status(200).json({
+    skipped: true,
+    reason: "30_sec_limit"
+  });
+}
     // если не пришли получатели — берём из самой задачи
     if (!assigneeIds.length) {
       if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
@@ -133,9 +173,17 @@ export default async function handler(req, res) {
     };
 
     console.log("📤 Message (data-only):", { android: message.android, data: message.data });
-
+console.log("📤 Sending notification...");
+console.log("Task:", taskId);
+console.log("Recipients:", tokens.length);
+console.log("Author:", authorUid);
     const sendResult = await admin.messaging().sendEachForMulticast({ tokens, ...message });
+await snap.ref.update({
+  notificationSent: true,
+  notificationSentAt: admin.firestore.FieldValue.serverTimestamp()
+});
 
+console.log("✅ notificationSent=true");
     console.log(`📨 Sent: ${sendResult.successCount}, failed: ${sendResult.failureCount}, tried: ${tokens.length}`);
     return res.status(200).json({
       sent: sendResult.successCount,
