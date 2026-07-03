@@ -78,76 +78,23 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
 
 export default async function handler(req, res) {
   try {
-    console.log("===== REQUEST =====");
-console.log({
-  time: new Date().toISOString(),
-  taskId: req.body?.taskId,
-  ua: req.headers["user-agent"],
-  ip: req.headers["x-forwarded-for"],
-});
-    console.log("==========================================");
-console.log("NEW REQUEST");
-console.log("Time:", new Date().toISOString());
-
-console.log({
-  ip:
-    req.headers["x-forwarded-for"] ||
-    req.headers["x-real-ip"],
-
-  ua: req.headers["user-agent"],
-
-  origin: req.headers["origin"],
-
-  referer: req.headers["referer"]
-});
-
-console.log("Body:", req.body);
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
     const taskId = String(req.body?.taskId || "").trim();
     if (!taskId) return res.status(400).send("taskId required");
-// 🚀 МГНОВЕННЫЙ ОТВЕТ — ОТКЛЮЧАЕТ RETRY
-res.status(200).json({
-  ok: true,
-  queued: true
-});
+
     // может прийти "uid1,uid2"
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
     let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     initAdmin();
     const db = admin.firestore();
-    // 🚀 ОТВЕТ СРАЗУ
-res.status(200).json({ ok: true });
 
     // читаем задачу
     const snap = await db.collection("tasks").doc(taskId).get();
     if (!snap.exists) return res.status(404).send("task not found");
     const task = snap.data() || {};
-// ===== АНТИСПАМ =====
-const now = Date.now();
 
-if (task.notificationSent === true) {
-  console.log("⛔ Notification already sent for task:", taskId);
-  return res.status(200).json({
-    skipped: true,
-    reason: "already_sent"
-  });
-}
-
-const lastSent =
-  task.notificationSentAt?.toMillis?.() ||
-  task.notificationSentAt ||
-  0;
-
-if (lastSent && (now - lastSent) < 30000) {
-  console.log("⛔ Duplicate request blocked (30 sec):", taskId);
-console.log("===== FINISHED =====", taskId);
-  return res.status(200).json({
-    skipped: true,
-    reason: "30_sec_limit"
-  });
-}
     // если не пришли получатели — берём из самой задачи
     if (!assigneeIds.length) {
       if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
@@ -186,35 +133,17 @@ console.log("===== FINISHED =====", taskId);
     };
 
     console.log("📤 Message (data-only):", { android: message.android, data: message.data });
-console.log("📤 Sending notification...");
-console.log("Task:", taskId);
-console.log("Recipients:", tokens.length);
-console.log("Author:", authorUid);
-    res.status(200).json({ ok: true, queued: true });
 
+    const sendResult = await admin.messaging().sendEachForMulticast({ tokens, ...message });
 
-// всё остальное уходит в фон
-(async () => {
-  try {
-    const sendResult = await admin.messaging().sendEachForMulticast({
-      tokens,
-      ...message
+    console.log(`📨 Sent: ${sendResult.successCount}, failed: ${sendResult.failureCount}, tried: ${tokens.length}`);
+    return res.status(200).json({
+      sent: sendResult.successCount,
+      failed: sendResult.failureCount,
+      tokensTried: tokens.length,
     });
-
-    await snap.ref.update({
-      notificationSent: true,
-      notificationSentAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    console.log("BG sent:", sendResult.successCount);
-
-  } catch (e) {
-    console.error("BG ERROR:", e);
-  }
-})();
   } catch (e) {
     console.error("🔥 Server error:", e);
     return res.status(500).json({ error: e.message });
   }
 }
-
