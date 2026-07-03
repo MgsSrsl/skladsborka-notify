@@ -56,6 +56,21 @@ async function collectTokens({ db, assigneeIds, authorUid }) {
 }
 
 export default async function handler(req, res) {
+  const db = admin.firestore();
+
+const lockRef = db.collection("locks").doc(taskId);
+
+const lockSnap = await lockRef.get();
+if (lockSnap.exists) {
+  return res.status(200).json({
+    skipped: true,
+    reason: "locked"
+  });
+}
+
+await lockRef.set({
+  createdAt: Date.now()
+});
   try {
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method Not Allowed" });
