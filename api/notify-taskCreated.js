@@ -103,12 +103,12 @@ await lockRef.set({
     // 🔥 ANTI DUPLICATE CORE
     // =========================
 
-    if (task.pushSentAt) {
-      return res.status(200).json({
-        skipped: true,
-        reason: "already_sent",
-      });
-    }
+    if (task.pushSentAt || lockSnap.exists) {
+  return res.status(200).json({
+    skipped: true,
+    reason: "already_processed"
+  });
+}
 
     // fallback: берём из задачи
     if (!assigneeIds.length) {
