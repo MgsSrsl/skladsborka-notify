@@ -106,13 +106,19 @@ console.log("Body:", req.body);
 
     const taskId = String(req.body?.taskId || "").trim();
     if (!taskId) return res.status(400).send("taskId required");
-
+// 🚀 МГНОВЕННЫЙ ОТВЕТ — ОТКЛЮЧАЕТ RETRY
+res.status(200).json({
+  ok: true,
+  queued: true
+});
     // может прийти "uid1,uid2"
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
     let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
 
     initAdmin();
     const db = admin.firestore();
+    // 🚀 ОТВЕТ СРАЗУ
+res.status(200).json({ ok: true });
 
     // читаем задачу
     const snap = await db.collection("tasks").doc(taskId).get();
@@ -184,19 +190,28 @@ console.log("📤 Sending notification...");
 console.log("Task:", taskId);
 console.log("Recipients:", tokens.length);
 console.log("Author:", authorUid);
-    const sendResult = await admin.messaging().sendEachForMulticast({ tokens, ...message });
-await snap.ref.update({
-  notificationSent: true,
-  notificationSentAt: admin.firestore.FieldValue.serverTimestamp()
-});
+    res.status(200).json({ ok: true, queued: true });
+    res.status(200).json({ ok: true });
 
-console.log("✅ notificationSent=true");
-    console.log(`📨 Sent: ${sendResult.successCount}, failed: ${sendResult.failureCount}, tried: ${tokens.length}`);
-    return res.status(200).json({
-      sent: sendResult.successCount,
-      failed: sendResult.failureCount,
-      tokensTried: tokens.length,
+// всё остальное уходит в фон
+(async () => {
+  try {
+    const sendResult = await admin.messaging().sendEachForMulticast({
+      tokens,
+      ...message
     });
+
+    await snap.ref.update({
+      notificationSent: true,
+      notificationSentAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log("BG sent:", sendResult.successCount);
+
+  } catch (e) {
+    console.error("BG ERROR:", e);
+  }
+})();
   } catch (e) {
     console.error("🔥 Server error:", e);
     return res.status(500).json({ error: e.message });
