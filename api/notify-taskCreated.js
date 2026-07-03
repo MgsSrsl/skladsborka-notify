@@ -191,7 +191,7 @@ console.log("Task:", taskId);
 console.log("Recipients:", tokens.length);
 console.log("Author:", authorUid);
     res.status(200).json({ ok: true, queued: true });
-    res.status(200).json({ ok: true });
+
 
 // всё остальное уходит в фон
 (async () => {
