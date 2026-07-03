@@ -202,3 +202,4 @@ console.log("✅ notificationSent=true");
     return res.status(500).json({ error: e.message });
   }
 }
+console.log("===== FINISHED =====", taskId);
