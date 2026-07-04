@@ -126,20 +126,28 @@ export default async function handler(req, res) {
     const task = snap.data() || {};
 
     // защита от очень старых уведомлений
-    const created = task.createdAt?.toDate?.();
+    const created =
+  task.createdAt && typeof task.createdAt.toDate === "function"
+    ? task.createdAt.toDate()
+    : null;
 
-    if (created) {
-      const ageHours = (Date.now() - created.getTime()) / 3600000;
+if (created instanceof Date) {
+  const ageMs = Date.now() - created.getTime();
 
-      if (ageHours > 24) {
-        console.log("⚠ Task too old:", ageHours.toFixed(1), "hours");
+  if (ageMs > 24 * 60 * 60 * 1000) {
+    console.log(
+      "⚠ Skip old task:",
+      taskId,
+      "created:",
+      created.toISOString()
+    );
 
-        return res.status(200).json({
-          ok: true,
-          ignored: "task_too_old"
-        });
-      }
-    }
+    return res.status(200).json({
+      ok: true,
+      ignored: "task_too_old"
+    });
+  }
+}
 
     if (!assigneeIds.length) {
       if (Array.isArray(task.assigneeIds))
