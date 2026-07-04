@@ -72,6 +72,13 @@ if (!taskId) {
     if (!docSnap) return res.status(404).json({ ok: false, error: "task not found" });
 
     const task = docSnap.data() || {};
+    // 🔒 защита от дублей (ключевой фикс)
+if (task.notifyFinishedProcessed) {
+  return res.status(200).json({
+    ok: true,
+    skipped: "already_processed"
+  });
+}
     // ===== защита от старых задач (старше 24 часов) =====
 const created =
   task.createdAt && typeof task.createdAt.toDate === "function"
@@ -153,7 +160,11 @@ if (created instanceof Date) {
     };
 
     const out = await admin.messaging().sendEachForMulticast(payload);
-
+await docSnap.ref.update({
+  notifyFinishedProcessed: true,
+  notifyFinishedSentAt: admin.firestore.FieldValue.serverTimestamp(),
+  notifyFinishedSuccess: out.successCount,
+});
     // очистка битых токенов
     const errors = out.responses
       .map((r, i) => (r.error ? { token: tokens[i], error: r.error.message } : null))
