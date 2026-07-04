@@ -81,78 +81,166 @@ export default async function handler(req, res) {
     console.log("🔥 notify-taskCreated CALLED", new Date().toISOString());
     console.log("METHOD:", req.method);
     console.log("URL:", req.url);
+    console.log("IP:", req.headers["x-forwarded-for"]);
     console.log("USER-AGENT:", req.headers["user-agent"]);
-    console.log("BODY:", req.body);
-    
+    console.log("BODY:", JSON.stringify(req.body));
 
-    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
-
-  
+    if (req.method !== "POST") {
+      return res.status(405).send("Method Not Allowed");
+    }
 
     const taskId = String(req.body?.taskId || "").trim();
-    console.log("TASK ID:", taskId);
-console.log("ASSIGNEES RAW:", req.body?.assigneeIds);
-    // может прийти "uid1,uid2"
+
+    if (!taskId) {
+      console.log("⚠ Missing taskId");
+      return res.status(200).json({
+        ok: true,
+        ignored: "missing_taskId"
+      });
+    }
+
     const rawAssignees = String(req.body?.assigneeIds || "").trim();
-    let assigneeIds = rawAssignees ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean) : [];
+    let assigneeIds = rawAssignees
+      ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
+      : [];
 
     initAdmin();
     const db = admin.firestore();
-console.log("READING TASK FROM FIRESTORE");
-    // читаем задачу
+
+    console.log("📖 Reading task:", taskId);
+
     const snap = await db.collection("tasks").doc(taskId).get();
-    if (!snap.exists) return res.status(404).send("task not found");
+
+    if (!snap.exists) {
+      console.log("⚠ Task not found:", taskId);
+
+      // ВАЖНО!
+      // Возвращаем 200, чтобы старые клиенты удалили запрос
+      // из своей очереди и больше не спамили сервер.
+      return res.status(200).json({
+        ok: true,
+        ignored: "task_not_found"
+      });
+    }
+
     const task = snap.data() || {};
 
-    // если не пришли получатели — берём из самой задачи
+    // защита от очень старых уведомлений
+    const created = task.createdAt?.toDate?.();
+
+    if (created) {
+      const ageHours = (Date.now() - created.getTime()) / 3600000;
+
+      if (ageHours > 24) {
+        console.log("⚠ Task too old:", ageHours.toFixed(1), "hours");
+
+        return res.status(200).json({
+          ok: true,
+          ignored: "task_too_old"
+        });
+      }
+    }
+
     if (!assigneeIds.length) {
-      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
-      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees.filter(Boolean);
+      if (Array.isArray(task.assigneeIds))
+        assigneeIds = task.assigneeIds.filter(Boolean);
+      else if (Array.isArray(task.assignees))
+        assigneeIds = task.assignees.filter(Boolean);
     }
 
-    const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
-    console.log("🧾 Task", { taskId, authorUid, assigneeIdsCount: assigneeIds.length });
+    const authorUid =
+      task.creatorId ||
+      task.authorUid ||
+      task.createdBy ||
+      "";
 
-    // получаем токены
-    const tokens = await collectTargetTokens({ db, assigneeIds, authorUid });
+    console.log("🧾 Task", {
+      taskId,
+      authorUid,
+      assigneeIdsCount: assigneeIds.length
+    });
+
+    const tokens = await collectTargetTokens({
+      db,
+      assigneeIds,
+      authorUid
+    });
+
     if (!tokens.length) {
-      console.log("ℹ️ No tokens found — skip send");
-      return res.status(200).json({ sent: 0, reason: "no tokens" });
+      console.log("ℹ No tokens found");
+
+      return res.status(200).json({
+        ok: true,
+        sent: 0
+      });
     }
 
-    // текст уведомления
-    const title = task.title ? String(task.title) : `Задача ${taskId}`;
-    const body =
-      (task.comment && String(task.comment)) ||
-      (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
+    const title =
+      task.title || `Задача ${taskId}`;
 
-    // ⚙️ data-only сообщение (без notification части)
+    const body =
+      task.comment ||
+      (task.creatorName
+        ? `От: ${task.creatorName}`
+        : "Новое задание");
+
     const message = {
       android: {
         priority: "high",
-        ttl: 24 * 60 * 60, // секунды
-        // collapseKey оставим пустым => не будет схлопываться очередь
+        ttl: 24 * 60 * 60
       },
       data: {
         type: "taskCreated",
         taskId: String(taskId),
-        title,
-        body,
-      },
+        title: String(title),
+        body: String(body)
+      }
     };
 
-    console.log("📤 Message (data-only):", { android: message.android, data: message.data });
+    console.log("📤 Sending to", tokens.length, "tokens");
 
-    const sendResult = await admin.messaging().sendEachForMulticast({ tokens, ...message });
+    const sendResult =
+      await admin.messaging().sendEachForMulticast({
+        tokens,
+        ...message
+      });
 
-    console.log(`📨 Sent: ${sendResult.successCount}, failed: ${sendResult.failureCount}, tried: ${tokens.length}`);
+    console.log(
+      "✅ Success:",
+      sendResult.successCount,
+      "Failed:",
+      sendResult.failureCount
+    );
+
     return res.status(200).json({
+      ok: true,
       sent: sendResult.successCount,
       failed: sendResult.failureCount,
-      tokensTried: tokens.length,
+      tokensTried: tokens.length
     });
+
   } catch (e) {
+
     console.error("🔥 Server error:", e);
-    return res.status(500).json({ error: e.message });
+
+    // Если закончились лимиты Firestore —
+    // НЕ провоцируем старые приложения повторять запросы бесконечно.
+    if (
+      String(e.message).includes("RESOURCE_EXHAUSTED") ||
+      String(e.details || "").includes("Quota exceeded")
+    ) {
+
+      console.log("⚠ Firestore quota exceeded. Returning 200.");
+
+      return res.status(200).json({
+        ok: true,
+        ignored: "quota_exceeded"
+      });
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: e.message
+    });
   }
 }
