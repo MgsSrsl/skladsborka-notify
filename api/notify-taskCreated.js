@@ -1,4 +1,3 @@
-// /api/notify-taskCreated.js  (ESM, "type":"module")
 import admin from "firebase-admin";
 
 let app;
@@ -10,222 +9,154 @@ function initAdmin() {
   if (!raw) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT");
 
   const sa = JSON.parse(raw);
-  sa.private_key = sa.private_key.replace(/\\n/g, "\n").replace(/\r\n/g, "\n").trim();
+  sa.private_key = sa.private_key.replace(/\\n/g, "\n").trim();
 
   app = admin.initializeApp({
     credential: admin.credential.cert(sa),
     projectId: sa.project_id,
   });
 
-  console.log("✅ Firebase initialized:", sa.project_id);
   return app;
 }
 
-// --- helpers ---
 function normRole(role) {
   const s = String(role || "").toLowerCase().trim();
-  if (["кладовщик", "кладовщица", "storekeeper", "kladovshik", "кладовщик склада"].includes(s)) return "storekeeper";
-  if (["начальник", "head", "boss"].includes(s)) return "head";
   if (["менеджер", "manager"].includes(s)) return "manager";
+  if (["кладовщик", "storekeeper"].includes(s)) return "storekeeper";
+  if (["head", "начальник"].includes(s)) return "head";
   return s;
 }
 
-async function getUserById(db, uid) {
+async function getUser(db, uid) {
   const snap = await db.collection("users").doc(uid).get();
-  return { id: uid, ...(snap.data() || {}) };
+  return snap.exists ? snap.data() : null;
 }
 
-async function collectTargetTokens({ db, assigneeIds, authorUid }) {
+async function collectTokens(db, assigneeIds, authorUid) {
   let tokens = [];
-  const pickedUsers = [];
+  const seen = new Set();
 
-  if (Array.isArray(assigneeIds) && assigneeIds.length) {
+  const add = (list) => {
+    for (const t of list || []) {
+      if (!seen.has(t)) {
+        seen.add(t);
+        tokens.push(t);
+      }
+    }
+  };
+
+  if (assigneeIds.length) {
     for (const uid of assigneeIds) {
-      const u = await getUserById(db, uid);
-      pickedUsers.push({ uid, role: u.role, onPickup: u.onPickup, tokenCount: (u.fcmTokens || []).length });
-      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
-      for (const t of list) if (t) tokens.push(t);
+      const u = await getUser(db, uid);
+      if (u?.fcmTokens) add(u.fcmTokens);
     }
   } else {
     const qs = await db.collection("users").where("onPickup", "==", true).get();
 
-    for (const doc of qs.docs) {
-      const u = doc.data() || {};
-      const role = normRole(u.role);
-
-      if (role !== "storekeeper" && role !== "head") continue;
-
-      pickedUsers.push({
-        uid: doc.id,
-        role: u.role,
-        onPickup: true,
-        tokenCount: (u.fcmTokens || []).length
-      });
-
-      const list = Array.isArray(u.fcmTokens) ? u.fcmTokens : [];
-      for (const t of list) if (t) tokens.push(t);
-    }
+    qs.forEach(doc => {
+      const u = doc.data();
+      if (["storekeeper", "head"].includes(normRole(u.role))) {
+        add(u.fcmTokens);
+      }
+    });
   }
 
-  tokens = [...new Set(tokens)];
-
+  // исключаем автора
   if (authorUid) {
-    const au = await getUserById(db, authorUid);
-    const authorTokens = new Set(Array.isArray(au.fcmTokens) ? au.fcmTokens.filter(Boolean) : []);
+    const au = await getUser(db, authorUid);
+    const authorTokens = new Set(au?.fcmTokens || []);
     tokens = tokens.filter(t => !authorTokens.has(t));
   }
 
-  console.log("👥 Picked users:", pickedUsers.length, "🎫 Tokens:", tokens.length);
   return tokens;
 }
 
 export default async function handler(req, res) {
   try {
-    console.log("🔥 notify-taskCreated CALLED", new Date().toISOString());
-
-    if (req.method !== "POST") {
-      return res.status(405).json({
-        ok: true,
-        final: true,
-        stop: true,
-        reason: "method_not_allowed"
-      });
-    }
-
     initAdmin();
     const db = admin.firestore();
 
-    const taskId = String(req.body?.taskId || "").trim();
+    const taskId = req.body?.taskId || req.query?.taskId;
 
     if (!taskId) {
-      return res.status(200).json({
-        ok: true,
-        final: true,
-        stop: true,
-        reason: "missing_taskId"
-      });
+      return res.status(200).json({ ok: true, stop: true });
     }
 
-    const rawAssignees = String(req.body?.assigneeIds || "").trim();
+    const ref = db.collection("tasks").doc(taskId);
 
-    let assigneeIds = rawAssignees
-      ? rawAssignees.split(",").map(s => s.trim()).filter(Boolean)
-      : [];
+    // 🔒 ATOMIC LOCK (главное решение)
+    const lockOk = await db.runTransaction(async tx => {
+      const snap = await tx.get(ref);
+      const data = snap.data();
 
-    const snap = await db.collection("tasks").doc(taskId).get();
+      if (!snap.exists) return false;
 
-    if (!snap.exists) {
-      return res.status(200).json({
-        ok: true,
-        final: true,
-        stop: true,
-        reason: "task_not_found"
-      });
-    }
+      if (data?.notifyCreatedProcessed) return false;
 
-    const task = snap.data() || {};
-
-    // 🔒 idempotency
-    if (task.notifyCreatedProcessed) {
-      return res.status(200).json({
-        ok: true,
-        final: true,
-        stop: true,
-        reason: "already_processed"
-      });
-    }
-
-    const created =
-      task.createdAt && typeof task.createdAt.toDate === "function"
-        ? task.createdAt.toDate()
-        : null;
-
-    if (created instanceof Date) {
-      const ageMs = Date.now() - created.getTime();
-
-      if (ageMs > 24 * 60 * 60 * 1000) {
-        return res.status(200).json({
-          ok: true,
-          final: true,
-          stop: true,
-          reason: "task_too_old"
-        });
+      const created = data?.createdAt?.toDate?.();
+      if (created) {
+        const ageMs = Date.now() - created.getTime();
+        if (ageMs > 24 * 60 * 60 * 1000) return false;
       }
-    }
 
-    if (!assigneeIds.length) {
-      if (Array.isArray(task.assigneeIds)) assigneeIds = task.assigneeIds.filter(Boolean);
-      else if (Array.isArray(task.assignees)) assigneeIds = task.assignees.filter(Boolean);
-    }
+      tx.update(ref, {
+        notifyCreatedProcessed: true,
+        notifyCreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
 
-    const authorUid =
-      task.creatorId ||
-      task.authorUid ||
-      task.createdBy ||
-      "";
-
-    const tokens = await collectTargetTokens({
-      db,
-      assigneeIds,
-      authorUid
+      return true;
     });
 
-    if (!tokens.length) {
-      return res.status(200).json({
-        ok: true,
-        final: true,
-        stop: true,
-        sent: 0
-      });
+    if (!lockOk) {
+      return res.status(200).json({ ok: true, stop: true });
     }
 
-    const title = task.title || `Задача ${taskId}`;
-    const body =
-      task.comment ||
-      (task.creatorName ? `От: ${task.creatorName}` : "Новое задание");
+    const taskSnap = await ref.get();
+    const task = taskSnap.data();
+
+    const assigneeIds = Array.isArray(task.assigneeIds)
+      ? task.assigneeIds
+      : [];
+
+    const authorUid = task.creatorId || task.authorUid || task.createdBy || "";
+
+    const tokens = await collectTokens(db, assigneeIds, authorUid);
+
+    if (!tokens.length) {
+      return res.status(200).json({ ok: true, stop: true, sent: 0 });
+    }
 
     const message = {
-      android: {
-        priority: "high",
-        ttl: 24 * 60 * 60
-      },
       tokens,
       notification: {
-        title,
-        body
+        title: task.title || "Новая задача",
+        body: task.comment || "Новое задание",
       },
       data: {
         type: "taskCreated",
         taskId: String(taskId),
-        title: String(title),
-        body: String(body)
-      }
+      },
     };
 
-    const sendResult = await admin.messaging().sendEachForMulticast(message);
+    const result = await admin.messaging().sendEachForMulticast(message);
 
-    await snap.ref.update({
-      notifyCreatedProcessed: true,
+    await ref.update({
       notifyCreatedSentAt: admin.firestore.FieldValue.serverTimestamp(),
-      notifyCreatedSuccess: sendResult.successCount
+      notifyCreatedSuccess: result.successCount,
     });
 
     return res.status(200).json({
       ok: true,
-      final: true,
-      stop: true,
-      sent: sendResult.successCount,
-      failed: sendResult.failureCount
+      sent: result.successCount,
+      failed: result.failureCount,
     });
 
   } catch (e) {
-    console.error("🔥 Server error:", e);
+    console.error(e);
 
     return res.status(200).json({
       ok: true,
-      final: true,
       stop: true,
-      error: e.message
     });
   }
 }
