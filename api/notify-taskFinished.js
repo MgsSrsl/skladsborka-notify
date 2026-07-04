@@ -19,13 +19,6 @@ function initAdmin() {
   return app;
 }
 
-function ymd(date) {
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
 async function findTaskDoc(db, taskId, daysBack = 30) {
   if (typeof taskId === "string" && taskId.includes("/")) {
     const snap = await db.doc(taskId).get();
@@ -41,7 +34,7 @@ async function findTaskDoc(db, taskId, daysBack = 30) {
     const dt = new Date(today);
     dt.setUTCDate(today.getUTCDate() - i);
 
-    const day = ymd(dt);
+    const day = dt.toISOString().slice(0, 10);
 
     snap = await db
       .collection("archives")
@@ -70,30 +63,31 @@ export default async function handler(req, res) {
     initAdmin();
     const db = admin.firestore();
 
-    const taskId =
-      req.method === "POST" ? req.body?.taskId : req.query.taskId;
+    const taskId = req.method === "POST"
+      ? req.body?.taskId
+      : req.query.taskId;
 
     if (!taskId) {
       return res.status(200).json({ ok: true, ignored: "missing_taskId" });
     }
 
-    // 🔥 ВАЖНО: только ОДНО получение документа
-    const docSnap = await findTaskDoc(db, taskId, 60);
+    const ref = db.collection("tasks").doc(taskId);
 
-    if (!docSnap) {
+    // 🔥 СНАЧАЛА быстрый lock-check (1 read максимум)
+    const pre = await ref.get();
+    if (pre.exists && pre.data()?.notifyFinishedProcessed) {
       return res.status(200).json({
         ok: true,
-        ignored: "task_not_found"
+        skipped: "already_processed"
       });
     }
 
-    const ref = docSnap.ref;
-
-    // 🔒 атомарный lock (без лишних get)
+    // 🔒 АТОМАРНЫЙ LOCK
     const lockOk = await db.runTransaction(async tx => {
       const snap = await tx.get(ref);
       const data = snap.data();
 
+      if (!snap.exists) return false;
       if (data?.notifyFinishedProcessed) return false;
 
       const created = data?.createdAt?.toDate?.();
@@ -117,7 +111,8 @@ export default async function handler(req, res) {
       });
     }
 
-    const task = docSnap.data() || {};
+    const taskSnap = await ref.get();
+    const task = taskSnap.data() || {};
 
     const title = task.title || "Без названия";
     const takenByName = task.takenByName || "кладовщик";
@@ -125,12 +120,12 @@ export default async function handler(req, res) {
     const managers = await getManagers(db);
 
     const tokens = [];
-    const tokenOwner = {};
+    const seen = {};
 
     for (const u of managers) {
-      for (const t of (u.fcmTokens || [])) {
-        if (!tokenOwner[t]) {
-          tokenOwner[t] = u.id;
+      for (const t of u.fcmTokens || []) {
+        if (!seen[t]) {
+          seen[t] = true;
           tokens.push(t);
         }
       }
@@ -140,7 +135,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, sent: 0 });
     }
 
-    const payload = {
+    const out = await admin.messaging().sendEachForMulticast({
       tokens,
       notification: {
         title: "Задача завершена",
@@ -149,9 +144,7 @@ export default async function handler(req, res) {
       data: {
         taskId: String(taskId),
       },
-    };
-
-    const out = await admin.messaging().sendEachForMulticast(payload);
+    });
 
     await ref.update({
       notifyFinishedSentAt: admin.firestore.FieldValue.serverTimestamp(),
