@@ -72,6 +72,29 @@ if (!taskId) {
     if (!docSnap) return res.status(404).json({ ok: false, error: "task not found" });
 
     const task = docSnap.data() || {};
+    // ===== защита от старых задач (старше 24 часов) =====
+const created =
+  task.createdAt && typeof task.createdAt.toDate === "function"
+    ? task.createdAt.toDate()
+    : null;
+
+if (created instanceof Date) {
+  const ageMs = Date.now() - created.getTime();
+
+  if (ageMs > 24 * 60 * 60 * 1000) {
+    console.log(
+      "[notify-taskFinished] Skip old task:",
+      taskId,
+      "created:",
+      created.toISOString()
+    );
+
+    return res.status(200).json({
+      ok: true,
+      ignored: "task_too_old"
+    });
+  }
+}
     const title = task.title || "Без названия";
     const takenByName = task.takenByName || task.assigneeNames?.[0] || "кладовщик";
 
