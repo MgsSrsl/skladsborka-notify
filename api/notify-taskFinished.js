@@ -19,12 +19,49 @@ function initAdmin() {
   return app;
 }
 
+function ymd(date) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+async function findTaskDoc(db, taskId, daysBack = 30) {
+  if (typeof taskId === "string" && taskId.includes("/")) {
+    const snap = await db.doc(taskId).get();
+    if (snap.exists) return snap;
+  }
+
+  let snap = await db.collection("tasks").doc(taskId).get();
+  if (snap.exists) return snap;
+
+  const today = new Date();
+
+  for (let i = 0; i <= daysBack; i++) {
+    const dt = new Date(today);
+    dt.setUTCDate(today.getUTCDate() - i);
+
+    const day = ymd(dt);
+
+    snap = await db
+      .collection("archives")
+      .doc(day)
+      .collection("tasks")
+      .doc(taskId)
+      .get();
+
+    if (snap.exists) return snap;
+  }
+
+  return null;
+}
+
 async function getManagers(db) {
   const roleValues = ["manager", "Manager", "менеджер", "Менеджер"];
   const snap = await db.collection("users").where("role", "in", roleValues).get();
 
   const users = [];
-  snap.forEach((d) => users.push({ id: d.id, ...d.data() }));
+  snap.forEach(d => users.push({ id: d.id, ...d.data() }));
   return users;
 }
 
@@ -40,35 +77,20 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ignored: "missing_taskId" });
     }
 
-    // =========================
-    // 🔥 ONLY FAST LOOKUP (NO ARCHIVES SCAN)
-    // =========================
-    const docSnap = await db.collection("tasks").doc(taskId).get();
+    // 🔥 ВАЖНО: только ОДНО получение документа
+    const docSnap = await findTaskDoc(db, taskId, 60);
 
-    if (!docSnap.exists) {
+    if (!docSnap) {
       return res.status(200).json({
         ok: true,
-        ignored: "task_not_found",
+        ignored: "task_not_found"
       });
     }
 
     const ref = docSnap.ref;
-    const task = docSnap.data() || {};
 
-    // =========================
-    // 🔒 FAST DEDUPE CHECK
-    // =========================
-    if (task.notifyFinishedProcessed) {
-      return res.status(200).json({
-        ok: true,
-        skipped: "already_processed",
-      });
-    }
-
-    // =========================
-    // 🔒 ATOMIC LOCK (anti-spam + race safe)
-    // =========================
-    const lockOk = await db.runTransaction(async (tx) => {
+    // 🔒 атомарный lock (без лишних get)
+    const lockOk = await db.runTransaction(async tx => {
       const snap = await tx.get(ref);
       const data = snap.data();
 
@@ -91,28 +113,22 @@ export default async function handler(req, res) {
     if (!lockOk) {
       return res.status(200).json({
         ok: true,
-        skipped: "locked_or_too_old",
+        skipped: "locked_or_too_old"
       });
     }
 
-    // =========================
-    // DATA
-    // =========================
-    const title = task.title || "Без названия";
-    const takenByName =
-      task.takenByName || task.assigneeNames?.[0] || "кладовщик";
+    const task = docSnap.data() || {};
 
-    // =========================
-    // TOKENS (managers only)
-    // =========================
+    const title = task.title || "Без названия";
+    const takenByName = task.takenByName || "кладовщик";
+
     const managers = await getManagers(db);
 
     const tokens = [];
     const tokenOwner = {};
 
     for (const u of managers) {
-      const list = u.fcmTokens || [];
-      for (const t of list) {
+      for (const t of (u.fcmTokens || [])) {
         if (!tokenOwner[t]) {
           tokenOwner[t] = u.id;
           tokens.push(t);
@@ -124,9 +140,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, sent: 0 });
     }
 
-    // =========================
-    // SEND PUSH
-    // =========================
     const payload = {
       tokens,
       notification: {
@@ -140,9 +153,6 @@ export default async function handler(req, res) {
 
     const out = await admin.messaging().sendEachForMulticast(payload);
 
-    // =========================
-    // UPDATE
-    // =========================
     await ref.update({
       notifyFinishedSentAt: admin.firestore.FieldValue.serverTimestamp(),
       notifyFinishedSuccess: out.successCount,
@@ -157,13 +167,6 @@ export default async function handler(req, res) {
 
   } catch (e) {
     console.error(e);
-
-    if (String(e.message).includes("RESOURCE_EXHAUSTED")) {
-      return res.status(200).json({
-        ok: true,
-        ignored: "quota_exceeded",
-      });
-    }
 
     return res.status(200).json({
       ok: true,
