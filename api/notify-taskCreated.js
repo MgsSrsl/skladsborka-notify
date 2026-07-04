@@ -124,7 +124,13 @@ export default async function handler(req, res) {
     }
 
     const task = snap.data() || {};
-
+// 🔒 идемпотентность: защита от повторных пушей
+if (task.notifyCreatedProcessed) {
+  return res.status(200).json({
+    ok: true,
+    skipped: "already_processed"
+  });
+}
     // защита от очень старых уведомлений
     const created =
   task.createdAt && typeof task.createdAt.toDate === "function"
@@ -209,6 +215,11 @@ if (created instanceof Date) {
 
     const sendResult =
       await admin.messaging().sendEachForMulticast({
+        await snap.ref.update({
+  notifyCreatedProcessed: true,
+  notifyCreatedSentAt: admin.firestore.FieldValue.serverTimestamp(),
+  notifyCreatedSuccess: sendResult.successCount
+});
         tokens,
         ...message
       });
