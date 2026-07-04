@@ -215,15 +215,14 @@ if (created instanceof Date) {
 
     const sendResult =
       await admin.messaging().sendEachForMulticast({
-        await snap.ref.update({
+        tokens,
+        ...message
+      });
+await snap.ref.update({
   notifyCreatedProcessed: true,
   notifyCreatedSentAt: admin.firestore.FieldValue.serverTimestamp(),
   notifyCreatedSuccess: sendResult.successCount
 });
-        tokens,
-        ...message
-      });
-
     console.log(
       "✅ Success:",
       sendResult.successCount,
