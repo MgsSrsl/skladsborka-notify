@@ -37,6 +37,7 @@ async function findTaskDoc(db, taskId, daysBack = 30) {
   if (snap.exists) return snap;
 
   const today = new Date();
+
   for (let i = 0; i <= daysBack; i++) {
     const dt = new Date(today);
     dt.setUTCDate(today.getUTCDate() - i);
@@ -55,12 +56,12 @@ async function findTaskDoc(db, taskId, daysBack = 30) {
   return null;
 }
 
-async function getUsers(db) {
+async function getManagers(db) {
   const roleValues = ["manager", "Manager", "менеджер", "Менеджер"];
-  const mgrs = await db.collection("users").where("role", "in", roleValues).get();
+  const snap = await db.collection("users").where("role", "in", roleValues).get();
 
   const users = [];
-  mgrs.forEach((d) => users.push({ id: d.id, ...d.data() }));
+  snap.forEach((d) => users.push({ id: d.id, ...d.data() }));
   return users;
 }
 
@@ -69,7 +70,7 @@ export default async function handler(req, res) {
     initAdmin();
     const db = admin.firestore();
 
-    let taskId =
+    const taskId =
       req.method === "POST" ? req.body?.taskId : req.query.taskId;
 
     if (!taskId) {
@@ -77,29 +78,40 @@ export default async function handler(req, res) {
     }
 
     const docSnap = await findTaskDoc(db, taskId, 60);
+
     if (!docSnap) {
-      return res.status(200).json({ ok: true, ignored: "task_not_found" });
+      return res.status(200).json({
+        ok: true,
+        ignored: "task_not_found",
+      });
     }
 
     const ref = docSnap.ref;
 
     // =========================
-    // 🔒 ATOMIC LOCK (ВАЖНО)
+    // 🔥 FAST PRE-CHECK (важно для старых клиентов)
+    // =========================
+    const quick = await ref.get();
+    if (quick.exists && quick.data()?.notifyFinishedProcessed) {
+      return res.status(200).json({
+        ok: true,
+        skipped: "already_processed",
+      });
+    }
+
+    // =========================
+    // 🔒 ATOMIC LOCK (главная защита)
     // =========================
     const lockOk = await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
+      const data = snap.data();
 
-      if (snap.data()?.notifyFinishedProcessed) {
-        return false;
-      }
+      if (data?.notifyFinishedProcessed) return false;
 
-      const created = snap.data()?.createdAt?.toDate?.();
-
+      const created = data?.createdAt?.toDate?.();
       if (created) {
         const ageMs = Date.now() - created.getTime();
-        if (ageMs > 24 * 60 * 60 * 1000) {
-          return false;
-        }
+        if (ageMs > 24 * 60 * 60 * 1000) return false;
       }
 
       tx.update(ref, {
@@ -122,14 +134,14 @@ export default async function handler(req, res) {
     const takenByName =
       task.takenByName || task.assigneeNames?.[0] || "кладовщик";
 
-    const users = await getUsers(db);
+    const managers = await getManagers(db);
 
     const tokens = [];
     const tokenOwner = {};
 
-    for (const u of users) {
-      const tks = u.fcmTokens || [];
-      for (const t of tks) {
+    for (const u of managers) {
+      const list = u.fcmTokens || [];
+      for (const t of list) {
         if (!tokenOwner[t]) {
           tokenOwner[t] = u.id;
           tokens.push(t);
@@ -165,6 +177,7 @@ export default async function handler(req, res) {
       sent: out.successCount,
       failed: out.failureCount,
     });
+
   } catch (e) {
     console.error(e);
 
@@ -176,8 +189,8 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
-      ok: false,
-      error: e.message,
+      ok: true,
+      ignored: "server_error",
     });
   }
 }
