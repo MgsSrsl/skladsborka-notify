@@ -158,7 +158,11 @@ if (created instanceof Date) {
       },
       data: { taskId: String(docSnap.id) }, // отправляем короткий id
     };
-
+// 🔒 1. сначала ЛОК (резервируем задачу)
+await docSnap.ref.update({
+  notifyFinishedProcessed: true,
+  notifyFinishedProcessingAt: admin.firestore.FieldValue.serverTimestamp(),
+});
     const out = await admin.messaging().sendEachForMulticast(payload);
 await docSnap.ref.update({
   notifyFinishedProcessed: true,
