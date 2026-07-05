@@ -59,10 +59,6 @@ function parseAllowedOrigins() {
 }
 
 function isAllowedRequest(req) {
-  /**
-   * Вариант 1 — секретный заголовок.
-   * Можно добавить в новую веб-страницу.
-   */
   const expectedSecret = String(process.env.NOTIFY_SECRET || "").trim();
   const gotSecret = String(getHeader(req, "x-notify-secret") || "").trim();
 
@@ -70,10 +66,6 @@ function isAllowedRequest(req) {
     return true;
   }
 
-  /**
-   * Вариант 2 — разрешаем только запросы с нашего сайта.
-   * Старые Android-клиенты обычно не присылают Origin/Referer.
-   */
   const allowedOrigins = parseAllowedOrigins();
 
   if (allowedOrigins.length) {
@@ -183,9 +175,14 @@ async function collectTargetTokens({ db, assigneeIds, authorUid }) {
 async function createNotifyLock(db, lockId) {
   const ref = db.collection("_notifyLocks").doc(lockId);
 
+  const expiresAt = admin.firestore.Timestamp.fromMillis(
+    Date.now() + 24 * 60 * 60 * 1000
+  );
+
   try {
     await ref.create({
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt,
     });
 
     return true;
@@ -232,11 +229,6 @@ export default async function handler(req, res) {
       return res.status(204).end();
     }
 
-    /**
-     * ВАЖНО:
-     * Не отдаём 405/401/403 старым клиентам.
-     * Им всегда 200, чтобы они не ретраили.
-     */
     if (req.method !== "POST") {
       return res.status(200).json({
         ok: true,
@@ -246,10 +238,6 @@ export default async function handler(req, res) {
       });
     }
 
-    /**
-     * САМАЯ ВАЖНАЯ ОТСЕЧКА.
-     * До этого места Firebase вообще не инициализировался.
-     */
     if (!isAllowedRequest(req)) {
       console.log("🚫 notify-taskCreated ignored: not allowed");
 
@@ -262,7 +250,6 @@ export default async function handler(req, res) {
     }
 
     const body = req.body || {};
-
     const taskId = String(body.taskId || "").trim();
 
     if (!taskId) {
@@ -277,13 +264,6 @@ export default async function handler(req, res) {
     initAdmin();
     const db = admin.firestore();
 
-    /**
-     * Защита от дублей.
-     * Даже если нормальный клиент случайно отправит 10 раз,
-     * пуш уйдёт только один раз.
-     *
-     * Это write, не read.
-     */
     const lockId = `taskCreated_${taskId}`;
     const firstTime = await createNotifyLock(db, lockId);
 
@@ -380,10 +360,6 @@ export default async function handler(req, res) {
   } catch (e) {
     console.error("🔥 notify-taskCreated error:", e);
 
-    /**
-     * Даже при ошибке отдаём 200.
-     * Notify не должен запускать бесконечные ретраи.
-     */
     return res.status(200).json({
       ok: true,
       sent: 0,
