@@ -1,8 +1,0 @@
-{
-  "name": "skladsborka-notify",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "firebase-admin": "^12.5.0"
-  }
-}
